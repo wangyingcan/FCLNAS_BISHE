@@ -1,0 +1,25 @@
+name: fdnas
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pip
+  # ===== PyTorch 栈（按你的 CUDA 版本替换，下面示例是 CUDA 11.8）=====
+  - pytorch=1.10
+  - torchvision=0.11
+  - cudatoolkit=11.3        # 如果用 pip/cuda=11.8 发行，可改成 pytorch-cuda=11.8
+  # ===== 常用科学计算/图像 =====
+  - numpy
+  - scipy
+  - scikit-learn
+  - pillow
+  - pyyaml
+  - tqdm
+  - matplotlib
+  # =====（可选）日志/可视化 =====
+  - tensorboard
+  - pip:
+      - thop              # 可选：FLOPs/参数量统计
+      - ptflops           # 可选：另一种 FLOPs 统计

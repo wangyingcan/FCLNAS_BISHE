@@ -1,0 +1,106 @@
+nohup: ignoring input
+/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:16: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml
+CifarRunConfig初始化完成...
+CifarRunConfig初始化完成...
+SuperProxylessNASNets初始化完成...
+set格式化参数开始...
+set格式化参数结束...
+Experiment dir : env_dir/search-grad-128-None-20251210-102547
+>>> 实际使用的物理 GPU UUID: GPU-552ecc6d-cbc5-ec48-f093-59b68b0db6d7
+开始执行任务 6/10
+CifarRunConfig初始化开始... is_client=True client_id=0
+SuperProxylessNASNets初始化开始...
+[FCL] Failed to load supernet from ./output_test2/fednas-grad02,3,4,3,4,3-task5/checkpoint/checkpoint.pth.tar
+[FCL] No previous task checkpoint found under ./output_test2/fednas-grad02,3,4,3,4,3-task5, start from scratch.
+CifarRunConfig初始化开始... is_client=False client_id=0
+RunManager初始化开始...
+Total training params: 57.62M
+Total FLOPs: 56.4M
+Measure latency for types: None
+The global_server user has 4500 training data, 500 valid data and 6000 test data.
+[/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:620]
+GradientArchSearchConfig
+SuperProxylessNASNets初始化开始...
+RunManager初始化开始...
+Total training params: 57.62M
+Total FLOPs: 56.4M
+Measure latency for types: None
+0 client has 4500 training data, 500 valid data and 6000 test data.
+[/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:1004]
+-----------------------------case baseline: fixed backbone--------------------------------
+CifarRunConfig初始化开始... is_client=False client_id=0
+[FCL] Loaded previous task supernet from ./output_test2/fednas-grad02,3,4,3,4,3-task5/checkpoint/checkpoint.pth.tar
+[Baseline] 已从 ./output_test2/fednas-grad02,3,4,3,4,3-task5 继承权重，task 6 在上一任务模型上继续训练
+[Baseline] 已从 ./output_test2/fednas-grad02,3,4,3,4,3-task5 继承教师模型
+RunManager初始化开始...
+Total training params: 11.23M
+Total FLOPs: 0.0M
+Measure latency for types: None
+Network configs dump to ./output_test2/fednas-grad02,3,4,3,4,3-task6/net.config
+Run configs dump to ./output_test2/fednas-grad02,3,4,3,4,3-task6/run.config
+CifarRunConfig初始化开始... is_client=True client_id=0
+RunManager初始化开始...
+Total training params: 11.23M
+Total FLOPs: 0.0M
+Measure latency for types: None
+The 0 user has 4500 training data and 6000 test data.
+tensorboardX logdir runs/Dec10_10-27-09_gpu6resnet18fed_retrain
+[Baseline] Loaded EWC state from prev task ./output_test2/fednas-grad02,3,4,3,4,3-task5/ewc_state.pt
+self.config.resume:  False
+[Retrain] start_round=0, last_round=20
+round 1
+2025-12-10 10:27:10
+[Replay] task6 client0 round_start size=0 hist={} mode=age_priority per_batch=64 cap=10000
+[kd_ortho] batch 0, cos(before)=0.1296, cos(after)=-0.0000
+重训阶段使用测试集进行精度评估
+[kd_ortho] batch 0, cos(before)=-0.1048, cos(after)=-0.0000
+[kd_ortho] batch 0, cos(before)=-0.3835, cos(after)=0.0000
+[kd_ortho] batch 0, cos(before)=-0.4759, cos(after)=0.0000
+重训阶段使用测试集进行精度评估
+[kd_ortho] batch 0, cos(before)=-0.4818, cos(after)=0.0000
+[Replay] task6 client0 round_end size=10000 hist={6: 10000}
+[2025-12-10 10:29:41]  retrain clients_trn_loss 4.8974, clients_trn_top1 8.8036, clients_val_loss 2.7020, clients_val_top1 33.2333, clients_lr 0.0004, round_time_use 2.5240
+重训阶段使用测试集进行精度评估
+USE: test_loader
+task_class_split: T1: [1, 7, 8, 11, 13, 23, 48, 54, 91, 94]; T2: [2, 16, 41, 47, 52, 63, 66, 78, 80, 87]; T3: [6, 10, 19, 22, 24, 29, 30, 37, 59, 83]; T4: [14, 28, 34, 43, 44, 81, 86, 88, 93, 99]; T5: [4, 15, 20, 21, 31, 57, 67, 70, 76, 84]; T6: [0, 25, 35, 46, 50, 69, 72, 73, 96, 98]; T7: [3, 26, 40, 55, 56, 58, 89, 90, 92, 95]; T8: [9, 18, 39, 42, 60, 68, 71, 75, 77, 82]; T9: [12, 17, 27, 32, 36, 45, 64, 74, 79, 85]; T10: [5, 33, 38, 49, 51, 53, 61, 62, 65, 97]
+per_task_test_top1: T1:41.00, T2:25.10, T3:26.10, T4:21.10, T5:44.60, T6:32.20
+forgetting_F_max: 0.00; per_task_F: T1:0.00, T2:0.00, T3:0.00, T4:0.00, T5:0.00, T6:0.00
+[2025-12-10 10:29:46] learned_net,test_eval loss 2.6984, top1 31.6833, top5 65.3000
+[EWC] round 0 consolidate fisher_keys=62 fisher_norm=297.2543 processed=1024
+round 2
+2025-12-10 10:29:49
+[Replay] task6 client0 round_start size=10000 hist={6: 10000} mode=age_priority per_batch=64 cap=10000
+[kd_ortho] batch 0, cos(before)=-0.3299, cos(after)=-0.0000
+[kd_ortho] batch 0, cos(before)=-0.3663, cos(after)=-0.0000
+重训阶段使用测试集进行精度评估
+[kd_ortho] batch 0, cos(before)=-0.3413, cos(after)=-0.0000
+[kd_ortho] batch 0, cos(before)=-0.3272, cos(after)=0.0000
+[kd_ortho] batch 0, cos(before)=-0.3071, cos(after)=0.0000
+重训阶段使用测试集进行精度评估
+[Replay] task6 client0 round_end size=10000 hist={6: 10000}
+[2025-12-10 10:32:56]  retrain clients_trn_loss 3.2674, clients_trn_top1 47.7366, clients_val_loss 2.7803, clients_val_top1 26.8500, clients_lr 0.0008, round_time_use 3.1106
+重训阶段使用测试集进行精度评估
+USE: test_loader
+task_class_split: T1: [1, 7, 8, 11, 13, 23, 48, 54, 91, 94]; T2: [2, 16, 41, 47, 52, 63, 66, 78, 80, 87]; T3: [6, 10, 19, 22, 24, 29, 30, 37, 59, 83]; T4: [14, 28, 34, 43, 44, 81, 86, 88, 93, 99]; T5: [4, 15, 20, 21, 31, 57, 67, 70, 76, 84]; T6: [0, 25, 35, 46, 50, 69, 72, 73, 96, 98]; T7: [3, 26, 40, 55, 56, 58, 89, 90, 92, 95]; T8: [9, 18, 39, 42, 60, 68, 71, 75, 77, 82]; T9: [12, 17, 27, 32, 36, 45, 64, 74, 79, 85]; T10: [5, 33, 38, 49, 51, 53, 61, 62, 65, 97]
+per_task_test_top1: T1:30.40, T2:17.70, T3:16.90, T4:11.80, T5:29.70, T6:54.60
+forgetting_F_max: 14.90; per_task_F: T1:10.60, T2:7.40, T3:9.20, T4:9.30, T5:14.90, T6:0.00
+[2025-12-10 10:33:01] learned_net,test_eval loss 2.7803, top1 26.8500, top5 64.8000
+[EWC] round 1 consolidate fisher_keys=62 fisher_norm=276.7556 processed=1024
+round 3
+2025-12-10 10:33:04
+[Replay] task6 client0 round_start size=10000 hist={6: 10000} mode=age_priority per_batch=64 cap=10000
+[kd_ortho] batch 0, cos(before)=-0.1144, cos(after)=0.0000
+[kd_ortho] batch 0, cos(before)=-0.2576, cos(after)=0.0000
+[kd_ortho] batch 0, cos(before)=-0.1473, cos(after)=-0.0000
+重训阶段使用测试集进行精度评估
+[kd_ortho] batch 0, cos(before)=-0.1264, cos(after)=-0.0000
+[kd_ortho] batch 0, cos(before)=-0.1029, cos(after)=0.0000
+[Replay] task6 client0 round_end size=10000 hist={6: 10000}
+[2025-12-10 10:36:05]  retrain clients_trn_loss 2.8911, clients_trn_top1 64.6414, clients_val_loss 2.8567, clients_val_top1 23.5167, clients_lr 0.0012, round_time_use 3.0122
+重训阶段使用测试集进行精度评估
+USE: test_loader
+task_class_split: T1: [1, 7, 8, 11, 13, 23, 48, 54, 91, 94]; T2: [2, 16, 41, 47, 52, 63, 66, 78, 80, 87]; T3: [6, 10, 19, 22, 24, 29, 30, 37, 59, 83]; T4: [14, 28, 34, 43, 44, 81, 86, 88, 93, 99]; T5: [4, 15, 20, 21, 31, 57, 67, 70, 76, 84]; T6: [0, 25, 35, 46, 50, 69, 72, 73, 96, 98]; T7: [3, 26, 40, 55, 56, 58, 89, 90, 92, 95]; T8: [9, 18, 39, 42, 60, 68, 71, 75, 77, 82]; T9: [12, 17, 27, 32, 36, 45, 64, 74, 79, 85]; T10: [5, 33, 38, 49, 51, 53, 61, 62, 65, 97]
+per_task_test_top1: T1:24.30, T2:13.60, T3:8.60, T4:7.60, T5:19.00, T6:61.50
+forgetting_F_max: 25.60; per_task_F: T1:16.70, T2:11.50, T3:17.50, T4:13.50, T5:25.60, T6:0.00
+[2025-12-10 10:36:10] learned_net,test_eval loss 2.9114, top1 22.4333, top5 63.1333

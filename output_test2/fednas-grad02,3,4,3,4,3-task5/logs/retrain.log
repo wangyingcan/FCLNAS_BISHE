@@ -1,0 +1,40 @@
+[2025-12-09 23:50:29]  retrain clients_trn_loss 3.9879, clients_trn_top1 34.3680, clients_val_loss 2.4945, clients_val_top1 36.7000, clients_lr 0.0004, round_time_use 2.3154
+[EWC] round 0 consolidate fisher_keys=62 fisher_norm=288.0402 processed=1024
+[2025-12-09 23:52:51]  retrain clients_trn_loss 2.9289, clients_trn_top1 49.8854, clients_val_loss 2.3357, clients_val_top1 41.2400, clients_lr 0.0008, round_time_use 2.2390
+[EWC] round 1 consolidate fisher_keys=62 fisher_norm=279.0572 processed=1024
+[2025-12-09 23:55:29]  retrain clients_trn_loss 2.5771, clients_trn_top1 64.8060, clients_val_loss 2.3279, clients_val_top1 40.7600, clients_lr 0.0012, round_time_use 2.5220
+[EWC] round 2 consolidate fisher_keys=62 fisher_norm=299.4498 processed=1024
+[2025-12-09 23:58:05]  retrain clients_trn_loss 2.4098, clients_trn_top1 73.1305, clients_val_loss 2.3599, clients_val_top1 39.1400, clients_lr 0.0016, round_time_use 2.4273
+[EWC] round 3 consolidate fisher_keys=62 fisher_norm=310.8152 processed=1024
+[2025-12-10 00:00:45]  retrain clients_trn_loss 2.3284, clients_trn_top1 77.5955, clients_val_loss 2.3900, clients_val_top1 39.2800, clients_lr 0.0020, round_time_use 2.5514
+[EWC] round 4 consolidate fisher_keys=62 fisher_norm=336.7170 processed=1024
+[2025-12-10 00:03:12]  retrain clients_trn_loss 2.2309, clients_trn_top1 81.4932, clients_val_loss 2.3644, clients_val_top1 38.9600, clients_lr 0.0007, round_time_use 2.3029
+[EWC] round 5 consolidate fisher_keys=62 fisher_norm=336.6202 processed=1024
+[2025-12-10 00:05:47]  retrain clients_trn_loss 2.1753, clients_trn_top1 83.2393, clients_val_loss 2.3389, clients_val_top1 40.1200, clients_lr 0.0004, round_time_use 2.4626
+[EWC] round 6 consolidate fisher_keys=62 fisher_norm=332.6144 processed=1024
+[2025-12-10 00:08:12]  retrain clients_trn_loss 2.1378, clients_trn_top1 84.0476, clients_val_loss 2.3484, clients_val_top1 39.9000, clients_lr 0.0002, round_time_use 2.2653
+[EWC] round 7 consolidate fisher_keys=62 fisher_norm=338.2174 processed=1024
+[2025-12-10 00:10:39]  retrain clients_trn_loss 2.1187, clients_trn_top1 84.7854, clients_val_loss 2.3492, clients_val_top1 40.2800, clients_lr 0.0001, round_time_use 2.3408
+[EWC] round 8 consolidate fisher_keys=62 fisher_norm=339.1870 processed=1024
+[2025-12-10 00:13:31]  retrain clients_trn_loss 2.1186, clients_trn_top1 84.4121, clients_val_loss 2.3401, clients_val_top1 40.3800, clients_lr 0.0000, round_time_use 2.7112
+[EWC] round 9 consolidate fisher_keys=62 fisher_norm=346.2296 processed=1024
+[2025-12-10 00:16:03]  retrain clients_trn_loss 2.1219, clients_trn_top1 84.7149, clients_val_loss 2.3414, clients_val_top1 40.4200, clients_lr 0.0000, round_time_use 2.4001
+[EWC] round 10 consolidate fisher_keys=62 fisher_norm=338.3853 processed=1024
+[2025-12-10 00:18:18]  retrain clients_trn_loss 2.1222, clients_trn_top1 84.5738, clients_val_loss 2.3412, clients_val_top1 40.5000, clients_lr 0.0002, round_time_use 2.1345
+[EWC] round 11 consolidate fisher_keys=62 fisher_norm=337.8168 processed=1024
+[2025-12-10 00:20:56]  retrain clients_trn_loss 2.1175, clients_trn_top1 84.5238, clients_val_loss 2.3349, clients_val_top1 40.4800, clients_lr 0.0004, round_time_use 2.5155
+[EWC] round 12 consolidate fisher_keys=62 fisher_norm=349.1475 processed=1024
+[2025-12-10 00:24:00]  retrain clients_trn_loss 2.1089, clients_trn_top1 84.9118, clients_val_loss 2.3354, clients_val_top1 40.5600, clients_lr 0.0007, round_time_use 2.9082
+[EWC] round 13 consolidate fisher_keys=62 fisher_norm=354.0028 processed=1024
+[2025-12-10 00:26:30]  retrain clients_trn_loss 2.1001, clients_trn_top1 85.5526, clients_val_loss 2.3286, clients_val_top1 40.8800, clients_lr 0.0010, round_time_use 2.3781
+[EWC] round 14 consolidate fisher_keys=62 fisher_norm=353.1108 processed=1024
+[2025-12-10 00:29:19]  retrain clients_trn_loss 2.0867, clients_trn_top1 86.4109, clients_val_loss 2.3381, clients_val_top1 41.4800, clients_lr 0.0013, round_time_use 2.6532
+[EWC] round 15 consolidate fisher_keys=62 fisher_norm=364.2866 processed=1024
+[2025-12-10 00:32:30]  retrain clients_trn_loss 2.0690, clients_trn_top1 87.2722, clients_val_loss 2.3503, clients_val_top1 40.5400, clients_lr 0.0016, round_time_use 2.9656
+[EWC] round 16 consolidate fisher_keys=62 fisher_norm=384.7916 processed=1024
+[2025-12-10 00:35:00]  retrain clients_trn_loss 2.0525, clients_trn_top1 88.3186, clients_val_loss 2.3520, clients_val_top1 40.1600, clients_lr 0.0018, round_time_use 2.4054
+[EWC] round 17 consolidate fisher_keys=62 fisher_norm=374.8824 processed=1024
+[2025-12-10 00:37:53]  retrain clients_trn_loss 2.0303, clients_trn_top1 89.1329, clients_val_loss 2.3531, clients_val_top1 40.6400, clients_lr 0.0019, round_time_use 2.7312
+[EWC] round 18 consolidate fisher_keys=62 fisher_norm=390.7026 processed=1024
+[2025-12-10 00:40:42]  retrain clients_trn_loss 2.0088, clients_trn_top1 90.6261, clients_val_loss 2.3614, clients_val_top1 40.5800, clients_lr 0.0020, round_time_use 2.6814
+[EWC] round 19 consolidate fisher_keys=62 fisher_norm=382.9266 processed=1024

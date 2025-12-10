@@ -210,9 +210,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_round", default=0, type=int, help="start round in fed_search")
     parser.add_argument("--last_round", default=10, type=int, help="last round in fed_search. 125 for all clients. 175 for cpu/gpu.")  # 讨论硬件差异时就多训练些联邦轮次
     parser.add_argument("--retrain_start_round", type=int, default=0, help="重训阶段起始轮次，默认沿用 start_round")
-    parser.add_argument("--retrain_last_round", type=int, default=5, help="重训阶段最后轮次，默认沿用 last_round")
+    parser.add_argument("--retrain_last_round", type=int, default=20, help="重训阶段最后轮次，默认沿用 last_round")
     parser.add_argument("--retrain_sequence_from_task1", action="store_true",
                         help="重训阶段依次从 task1 训练到当前任务，每个任务各跑 retrain_last_round 轮")
+    
+    
     parser.add_argument("--ewc_lambda", type=float, default=0.0,
                         help="重训阶段的 EWC 正则强度，0 表示关闭")
     parser.add_argument("--ewc_samples_per_task", type=int, default=512,
@@ -240,6 +242,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cl_ortho_method",type=str,default="none",choices=["none", "ogd", "pcgrad", "kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"],help="持续学习的正交更新方法：none / ogd / pcgrad / kd_ortho",)
     parser.add_argument("--cl_ortho_scale",type=float,default=1.0,help="正交投影强度系数，1.0 表示完全投影到正交子空间，<1 为部分投影",)
     parser.add_argument("--ortho_samples_per_task",type=int,default=2048,help="估计旧任务梯度方向时使用的样本上限，0 表示不估计（禁用正交基更新）",)
+    parser.add_argument("--replay_mode", type=str, default="none", choices=["none", "global", "task_balanced", "age_priority"], help="experience replay 模式：none/global/task_balanced/age_priority")
+    parser.add_argument("--replay_capacity", type=int, default=0, help="重放缓冲区最大样本量（全局计数）")
+    parser.add_argument("--replay_per_batch", type=int, default=0, help="每个 batch 从缓冲区重放的样本数")
+    
+    
+    # 分阶段可选覆盖：search_* 用于超网预热/搜索，retrain_* 用于重训；未提供则回落到上述全局参数
+    parser.add_argument("--search_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
+    parser.add_argument("--search_cl_ortho_scale", type=float, default=None)
+    parser.add_argument("--search_ortho_samples_per_task", type=int, default=None)
+    parser.add_argument("--search_cl_kd_method", type=str, default=None, choices=["none","logit","logit_conf"])
+    parser.add_argument("--search_cl_kd_logit_lambda", type=float, default=None)
+    parser.add_argument("--search_cl_kd_temperature", type=float, default=None)
+    parser.add_argument("--search_cl_kd_conf_threshold", type=float, default=None)
+    parser.add_argument("--search_ewc_lambda", type=float, default=None)
+    parser.add_argument("--search_ewc_samples_per_task", type=int, default=None)
+    parser.add_argument("--search_ewc_online_interval", type=int, default=None)
+    parser.add_argument("--search_cl_reg_method", type=str, default=None, choices=["ewc","mas","rwalk"])
+    parser.add_argument("--search_cl_reg_decay", type=float, default=None)
+    parser.add_argument("--search_cl_reg_clip", type=float, default=None)
+    parser.add_argument("--search_cl_penalty_clip", type=float, default=None)
+    parser.add_argument("--search_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
+    parser.add_argument("--search_replay_capacity", type=int, default=None)
+    parser.add_argument("--search_replay_per_batch", type=int, default=None)
+    
+    parser.add_argument("--retrain_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
+    parser.add_argument("--retrain_cl_ortho_scale", type=float, default=None)
+    parser.add_argument("--retrain_ortho_samples_per_task", type=int, default=None)
+    parser.add_argument("--retrain_cl_kd_method", type=str, default=None, choices=["none","logit","logit_conf"])
+    parser.add_argument("--retrain_cl_kd_logit_lambda", type=float, default=None)
+    parser.add_argument("--retrain_cl_kd_temperature", type=float, default=None)
+    parser.add_argument("--retrain_cl_kd_conf_threshold", type=float, default=None)
+    parser.add_argument("--retrain_ewc_lambda", type=float, default=None)
+    parser.add_argument("--retrain_ewc_samples_per_task", type=int, default=None)
+    parser.add_argument("--retrain_ewc_online_interval", type=int, default=None)
+    parser.add_argument("--retrain_cl_reg_method", type=str, default=None, choices=["ewc","mas","rwalk"])
+    parser.add_argument("--retrain_cl_reg_decay", type=float, default=None)
+    parser.add_argument("--retrain_cl_reg_clip", type=float, default=None)
+    parser.add_argument("--retrain_cl_penalty_clip", type=float, default=None)
+    parser.add_argument("--retrain_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
+    parser.add_argument("--retrain_replay_capacity", type=int, default=None)
+    parser.add_argument("--retrain_replay_per_batch", type=int, default=None)
+    
 
     parser.add_argument("--local_epoch_number", default=5, type=int, help="local epoch each round in fed_search,during each epoch all data will be trained once")
 
@@ -338,11 +382,35 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     print("set格式化参数结束...")
 
+    # 记录可被阶段覆盖的参数初值，便于超网/重训使用不同超参
+    args._phase_base_params = {
+        k: getattr(args, k)
+        for k in [
+            "cl_ortho_method",
+            "cl_ortho_scale",
+            "ortho_samples_per_task",
+            "cl_kd_method",
+            "cl_kd_logit_lambda",
+            "cl_kd_temperature",
+            "cl_kd_conf_threshold",
+            "ewc_lambda",
+            "ewc_samples_per_task",
+            "ewc_online_interval",
+            "cl_reg_method",
+            "cl_reg_decay",
+            "cl_reg_clip",
+            "cl_penalty_clip",
+            "replay_mode",
+            "replay_capacity",
+            "replay_per_batch",
+        ]
+    }
+
     # 派生参数：保持原逻辑
     args.n_epochs = args.local_epoch_number * (args.last_round - args.start_round)
 
     # 构建保存目录名（原文件两次赋值，合并为等价流程，行为不变）
-    base_path = "./output_test4/fednas-" + args.arch_algo + str(args.manual_seed)
+    base_path = "./output_test2/fednas-" + args.arch_algo + str(args.manual_seed)
     if args.target_hardware is not None:
         base_path += args.target_hardware
     args.path = base_path + str(args.n_cell_stages)
@@ -356,6 +424,19 @@ def parse_args() -> argparse.Namespace:
 # ----------------------------- 主流程 -----------------------------
 def main():
     args = parse_args()
+
+    # 阶段参数覆盖
+    def _apply_phase_overrides(phase: str):
+        base = getattr(args, "_phase_base_params", {})
+        prefix = f"{phase}_"
+        for k, base_val in base.items():
+            override_val = getattr(args, prefix + k, None)
+            setattr(args, k, base_val if override_val is None else override_val)
+            
+    def _attach_replay_cfg(run_cfg, a):
+        """将回放相关超参挂到 run_config 上，便于 RunManager 读取。"""
+        for k in ["replay_mode", "replay_capacity", "replay_per_batch"]:
+            setattr(run_cfg, k, getattr(a, k, None))
 
     # 创建实验环境目录；保持异常可见
     try:
@@ -382,6 +463,9 @@ def main():
     uuid = pynvml.nvmlDeviceGetUUID(handle)
 
     print(">>> 实际使用的物理 GPU UUID:", uuid)
+
+    # 跨任务共享的 replay buffer（按 client 索引），避免每个任务重建导致忘记旧样本
+    replay_buffers_across_tasks = [None for _ in range(args.num_users)]
 
     # 遍历所有任务
     base_task_path = args.path
@@ -502,6 +586,7 @@ def main():
         # ---------------- 全局 server ----------------
         args.client_id = 0          # 任意给 id 即可
         run_config_global_server = CifarRunConfig(**args.__dict__, is_client = False)
+        _attach_replay_cfg(run_config_global_server, args)
         arch_search_config_global_server = copy.deepcopy(arch_search_config)
         global_server = ArchSearchRunManager(
             args.path, super_net, run_config_global_server,
@@ -563,6 +648,7 @@ def main():
             client = ArchSearchRunManager(args.path, local_client_super_net,
                                           clients_run_config_arr[idx], asc_local,task_id = args.task_id,
                                           init_model=not loaded_prev_supernet)
+            _attach_replay_cfg(client.run_manager.run_config, args)
             clients.append(client)
 
             print("{} client has {} training data, {} valid data and {} test data.".format(
@@ -595,6 +681,8 @@ def main():
             cm.test_inference()
 
         if args.object_to_search == "supernet":
+            # search 阶段可选覆盖
+            _apply_phase_overrides("search")
             # teacher：上一任务固化子网，用于 supernet KD / kd_ortho
             super_teacher_model = None
             need_super_teacher = args.cl_kd_logit_lambda > 0 or args.cl_ortho_method == "kd_ortho"
@@ -693,6 +781,8 @@ def main():
                 print('获取固化网络成功')
             
             # 三、子网重训阶段
+            # 重训阶段可选覆盖
+            _apply_phase_overrides("retrain")
             retrain_path = args.path + '/learned_net'
             # 如果跳过 search，但 learned_net 不存在，则尝试用当前 global_server 固化出子网
             if args.skip_search and not os.path.exists(os.path.join(retrain_path, "net.config")):
@@ -711,6 +801,7 @@ def main():
                 **args.__dict__,
                 is_client = False
             )
+            _attach_replay_cfg(global_run_config, args)
             
             # 加载子网结构与初始权重
             net_config_path = '%s/net.config' % args.path
@@ -758,7 +849,9 @@ def main():
                     print(f"[Retrain] 未能从 {prev_retrain_path} 加载教师模型，KD/kd_ortho 将跳过")
             
             # 全局 run_manager：基于当前子网初始化，后续可能加载 resume
-            global_run_manager = RunManager(args.path, copy.deepcopy(net), global_run_config, init_model=False)
+            global_run_manager = RunManager(
+                args.path, copy.deepcopy(net), global_run_config, init_model=False, task_id=task_id
+            )
             global_run_manager.save_config(print_info=True)
             if teacher_model is not None:
                 global_run_manager.set_teacher(teacher_model)
@@ -788,7 +881,15 @@ def main():
                 # 每个客户端使用全局权重的深拷贝进行本地训练，避免互相覆盖
                 client_net = copy.deepcopy(global_run_manager.net.module)
                 client_net.load_state_dict(base_retrain_state, strict=False)
-                client = RunManager(args.path, client_net, clients_run_config_arr[idx], init_model=False)
+                client = RunManager(
+                    args.path,
+                    client_net,
+                    clients_run_config_arr[idx],
+                    init_model=False,
+                    task_id=task_id,
+                    replay_buffer=replay_buffers_across_tasks[idx],
+                )
+                _attach_replay_cfg(client.run_config, args)
                 # retrain 阶段需要关闭 search，以便 valid() 使用测试集
                 client.run_config.search = False
                 clients.append(client)
@@ -895,12 +996,17 @@ def main():
                 print(f"[Retrain] task {retrain_task_id} 重训完成")
 
             print('所有客户端重训完成')
+            # 记录当前任务后每个客户端的 replay buffer，供下一任务复用
+            for idx, rm in enumerate(clients):
+                replay_buffers_across_tasks[idx] = rm.replay_buffer
 
         elif args.object_to_search == "baseline":
             print(line_info()); print("-----------------------------case baseline: fixed backbone--------------------------------")
+            _apply_phase_overrides("retrain")
             args.search = False
             args.client_id = 0
             global_run_config = CifarRunConfig(**args.__dict__, is_client=False)
+            _attach_replay_cfg(global_run_config, args)
             global_net = BaselineResNet(
                 arch=args.baseline_arch,
                 num_classes=global_run_config.data_provider.n_classes,
@@ -936,7 +1042,9 @@ def main():
                     print(f"[Baseline] 已从 {prev_task_path} 继承教师模型")
                 
             base_fixed_state = copy.deepcopy(global_net.state_dict())
-            global_run_manager = RunManager(args.path, global_net, global_run_config, init_model=False)
+            global_run_manager = RunManager(
+                args.path, global_net, global_run_config, init_model=False, task_id=task_id
+            )
             global_run_manager.save_config(print_info=True)
             if teacher_model is not None:
                 global_run_manager.set_teacher(teacher_model)
@@ -945,6 +1053,7 @@ def main():
             for idx in range(args.num_users):
                 args.client_id = idx
                 client_run_config = CifarRunConfig(**args.__dict__, is_client=True)
+                _attach_replay_cfg(client_run_config, args)
                 client_run_config.search = False
                 client_net = BaselineResNet(
                     arch=args.baseline_arch,
@@ -952,7 +1061,14 @@ def main():
                     pretrained=args.baseline_pretrained,
                 )
                 client_net.load_state_dict(base_fixed_state, strict=False)
-                client = RunManager(args.path, client_net, client_run_config, init_model=False)
+                client = RunManager(
+                    args.path,
+                    client_net,
+                    client_run_config,
+                    init_model=False,
+                    task_id=task_id,
+                    replay_buffer=replay_buffers_across_tasks[idx],
+                )
                 clients.append(client)
                 all_client_idx_arr.append(idx)
                 print("The {} user has {} training data and {} test data.".format(
@@ -1014,6 +1130,9 @@ def main():
                 client.load_ortho_state(ortho_state)
             
             all_clients.run()
+            # 记录当前任务的 replay buffer，供下一任务复用
+            for idx, rm in enumerate(clients):
+                replay_buffers_across_tasks[idx] = rm.replay_buffer
             
             # 保存 EWC 正则化模型
             if args.ewc_lambda > 0:

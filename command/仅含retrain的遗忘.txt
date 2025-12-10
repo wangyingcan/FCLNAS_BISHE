@@ -1,0 +1,13 @@
+python federated_continual_learning_main.py \
+  --num_tasks 10 --num_users 1 \
+  --dataset CIFAR100 --dataset_location /home/wyc/data \
+  --train_batch_size 128 --test_batch_size 128 \
+  --arch_algo grad --arch_lr 0.025 --gpu 2 --object_to_search supernet \
+  --init_lr 0.002 \
+  --cl_ortho_method kd_ortho --cl_ortho_scale 1.0 --ortho_samples_per_task 4096 \
+  --cl_kd_method logit --cl_kd_logit_lambda 1.0 --cl_kd_temperature 2.0 \
+  --ewc_lambda 50.0 --ewc_samples_per_task 1024 --ewc_online_interval 1 \
+  --cl_reg_method ewc --cl_reg_decay 1.0 \
+  --retrain_sequence_from_task1 --start_task_id 6 \
+  --search_cl_ortho_method none --search_cl_kd_method none \
+  --search_ewc_lambda 0 --search_ewc_samples_per_task 0 --search_ewc_online_interval 0

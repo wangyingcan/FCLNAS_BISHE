@@ -21,7 +21,108 @@ from models.normal_nets.proxyless_nets import ProxylessNASNets
 from modules.mix_op import MixedEdge
 import torch.nn.functional as F
 
-# run_manager is used by nas_manager
+import random
+
+# 简易经验回放 buffer（全局/任务均衡）
+class SimpleReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = max(0, capacity)
+        self.storage = []  # list of dict(x, y, task)
+        self._time = 0  # 递增时间戳，用于 age 加权采样
+
+    def __len__(self):
+        return len(self.storage)
+
+    def add_batch(self, x_tensor, y_tensor, task_id: int):
+        if self.capacity <= 0:
+            return
+        x_cpu = x_tensor.detach().cpu()
+        y_cpu = y_tensor.detach().cpu()
+        for xi, yi in zip(x_cpu, y_cpu):
+            self._time += 1
+            self.storage.append({"x": xi.clone(), "y": yi.clone(), "task": int(task_id), "t": self._time})
+        # 随机删除直至容量限制
+        self._rebalance_to_capacity()
+
+    def sample(self, k: int, mode: str = "global", exclude_task: int = None):
+        if self.capacity <= 0 or len(self.storage) == 0 or k <= 0:
+            return None, None
+        mode = (mode or "global").lower()
+        candidates = (
+            [e for e in self.storage if e["task"] != exclude_task]
+            if exclude_task is not None and mode == "task_balanced"
+            else list(self.storage)
+        )
+        if len(candidates) == 0:
+            return None, None
+        if mode == "task_balanced":
+            per_task = {}
+            for e in candidates:
+                per_task.setdefault(e["task"], []).append(e)
+            tasks = list(per_task.keys())
+            if len(tasks) == 0:
+                return None, None
+            per_k = max(1, k // len(tasks))
+            sampled = []
+            for t in tasks:
+                bucket = per_task[t]
+                take = min(per_k, len(bucket))
+                sampled.extend(random.sample(bucket, take))
+            if len(sampled) == 0:
+                return None, None
+            xs = torch.stack([e["x"] for e in sampled], dim=0)
+            ys = torch.stack([e["y"] for e in sampled], dim=0)
+            return xs, ys
+        elif mode == "age_priority":
+            # 按样本“年龄”加权采样，越早的样本权重越高
+            now = self._time if self._time > 0 else len(candidates)
+            weights = []
+            for e in candidates:
+                age = max(1, now - int(e.get("t", 0)) + 1)
+                weights.append(float(age))
+            take = min(k, len(candidates))
+            sampled = random.choices(candidates, weights=weights, k=take)
+            xs = torch.stack([e["x"] for e in sampled], dim=0)
+            ys = torch.stack([e["y"] for e in sampled], dim=0)
+            return xs, ys
+        else:
+            take = min(k, len(candidates))
+            sampled = random.sample(candidates, take)
+            xs = torch.stack([e["x"] for e in sampled], dim=0)
+            ys = torch.stack([e["y"] for e in sampled], dim=0)
+            return xs, ys
+
+    def set_capacity(self, capacity: int):
+        """调整容量并在需要时随机裁剪已有样本。"""
+        self.capacity = max(0, int(capacity))
+        self._rebalance_to_capacity()
+
+    def _rebalance_to_capacity(self):
+        """
+        保证容量约束，同时尽量保持不同 task 的样本均衡，
+        避免后续任务的新样本完全挤掉早期任务的样本。
+        """
+        if self.capacity <= 0:
+            self.storage = []
+            return
+        while len(self.storage) > self.capacity:
+            # 统计各 task 下标列表
+            task_indices = {}
+            for idx, item in enumerate(self.storage):
+                t = item.get("task", -1)
+                task_indices.setdefault(t, []).append(idx)
+            # 找到样本最多的 task，从中随机移除一个
+            biggest_task = max(task_indices, key=lambda k: len(task_indices[k]))
+            drop_idx = random.choice(task_indices[biggest_task])
+            self.storage.pop(drop_idx)
+
+    def task_hist(self):
+        """返回 {task_id: count} 便于检查 buffer 分布。"""
+        hist = {}
+        for item in self.storage:
+            t = int(item.get("task", -1))
+            hist[t] = hist.get(t, 0) + 1
+        return hist
 
 """
     RunConfig:运行配置基类
@@ -228,6 +329,7 @@ class RunManager:
         task_id=1,
         measure_latency=None,
         init_model=True,
+        replay_buffer=None,
     ):
         print("RunManager初始化开始...")
         self.path = path
@@ -251,6 +353,8 @@ class RunManager:
         self.round = 0
         # 最近一次测试的分任务精度，用于上层日志/遗忘分析
         self.last_task_acc = None
+        # 历史最佳分任务精度，便于计算遗忘 F
+        self.best_task_acc = {}
         # 用于 EWC 正则的快照与 Fisher 信息
         self.ewc_prev_params = None
         self.ewc_fisher = None
@@ -313,6 +417,16 @@ class RunManager:
         # kd_prev_grad_ortho：上一轮梯度缓存（按参数名，需 teacher 支持）
         self.prev_kd_grads = None  # dict[name] = tensor on CPU
         self.prev_kd_grads_history = []  # list[dict], 维护多轮 KD 参考
+        
+        # 重放配置
+        self.replay_mode = str(getattr(run_config, "replay_mode", "none")).lower()
+        self.replay_capacity = int(getattr(run_config, "replay_capacity", 0))
+        self.replay_per_batch = int(getattr(run_config, "replay_per_batch", 0))
+        if replay_buffer is not None:
+            replay_buffer.set_capacity(self.replay_capacity)
+            self.replay_buffer = replay_buffer
+        else:
+            self.replay_buffer = SimpleReplayBuffer(self.replay_capacity)
 
     def load_ewc_state(self, state):
         """加载外部保存的 EWC 状态；state=None 时重置。"""
@@ -1145,6 +1259,15 @@ class RunManager:
             )
             # 结果随着search、retrain阶段的变化而变化，打印到test_console.txt中
             self.write_log(log_str, prefix="test", should_print=True)
+            # 记录遗忘：F_t = best_so_far_t - current_t，F = max F_t
+            for t, acc in self.last_task_acc.items():
+                prev_best = self.best_task_acc.get(t, 0.0)
+                if acc > prev_best:
+                    self.best_task_acc[t] = acc
+            f_dict = {t: (self.best_task_acc.get(t, 0.0) - acc) for t, acc in self.last_task_acc.items()}
+            f_max = max(f_dict.values()) if f_dict else 0.0
+            f_str = ", ".join([f"T{t}:{v:.2f}" for t, v in sorted(f_dict.items())])
+            self.write_log(f"forgetting_F_max: {f_max:.2f}; per_task_F: {f_str}", prefix="test", should_print=True)
         else:
             self.last_task_acc = None
 
@@ -1209,6 +1332,25 @@ class RunManager:
             images, labels = images.to(self.device, non_blocking=True), labels.to(
                 self.device, non_blocking=True
             )
+            
+            # 经验回放：先记录当前 batch，稍后加入 buffer；如有重放样本则拼接
+            cur_x_cpu, cur_y_cpu = images.detach().cpu(), labels.detach().cpu()
+            if (
+                self.replay_mode != "none"
+                and self.replay_per_batch > 0
+                and len(self.replay_buffer) > 0
+            ):
+                rep_x, rep_y = self.replay_buffer.sample(
+                    self.replay_per_batch,
+                    mode=self.replay_mode,
+                    exclude_task=None if self.replay_mode == "global" else None,
+                )
+                if rep_x is not None and rep_y is not None and rep_x.numel() > 0:
+                    rep_x = rep_x.to(self.device, non_blocking=True)
+                    rep_y = rep_y.to(self.device, non_blocking=True)
+                    images = torch.cat([images, rep_x], dim=0)
+                    labels = torch.cat([labels, rep_y], dim=0)
+            
 
             # ========== 前向 ==========
             output = self.net(images)
@@ -1386,6 +1528,11 @@ class RunManager:
             # 更新参数
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
             self.optimizer.step()
+            
+            # 将当前任务样本加入重放缓冲区（仅当前 batch 原样本）
+            if self.replay_mode != "none" and self.replay_capacity > 0:
+                self.replay_buffer.add_batch(cur_x_cpu, cur_y_cpu, self.task_id)
+                
             # RWalk 路径积分累积
             if (
                 self.cl_reg_method == "rwalk"
@@ -1645,6 +1792,16 @@ class RunManager:
             AverageMeter(),
             AverageMeter(),
         )
+        # 记录本轮开始前的回放缓存分布，便于观测旧任务样本是否被保留
+        if self.replay_mode != "none" and self.replay_capacity > 0:
+            hist_start = self.replay_buffer.task_hist()
+            self.write_log(
+                f"[Replay] task{self.task_id} client{self.run_config.data_provider.client_id} "
+                f"round_start size={len(self.replay_buffer)} hist={hist_start} "
+                f"mode={self.replay_mode} per_batch={self.replay_per_batch} cap={self.replay_capacity}",
+                prefix="train",
+                should_print=True,
+            )
         # RWalk 路径快照
         prev_params_snapshot = None
         if self.cl_reg_method == "rwalk":
@@ -1678,6 +1835,15 @@ class RunManager:
                 writer.add_scalar(tb_prefix + "_val_loss", val_loss, epoch)
                 writer.add_scalar(tb_prefix + "_val_top1", val_acc, epoch)
                 writer.add_scalar(tb_prefix + "_val_top5", val_acc5, epoch)
+        # 记录本轮结束后的回放缓存分布
+        if self.replay_mode != "none" and self.replay_capacity > 0:
+            hist_end = self.replay_buffer.task_hist()
+            self.write_log(
+                f"[Replay] task{self.task_id} client{self.run_config.data_provider.client_id} "
+                f"round_end size={len(self.replay_buffer)} hist={hist_end}",
+                prefix="train",
+                should_print=True,
+            )
         lr_value = lr.avg if isinstance(lr, AverageMeter) else lr
         return (
             train_losses_arr.avg,

@@ -19,6 +19,9 @@ def set_layer_from_config(layer_config):
         LinearLayer.__name__: LinearLayer,
         MBInvertedConvLayer.__name__: MBInvertedConvLayer,
         ZeroLayer.__name__: ZeroLayer,
+        ResNetBlock.__name__: ResNetBlock,
+        DenseNetBlock.__name__: DenseNetBlock,
+        SEBlock.__name__: SEBlock,
     }
 
     layer_name = layer_config.pop('name')
@@ -542,9 +545,6 @@ class MBInvertedConvLayer(MyModule):
     @staticmethod
     def is_zero_layer():
         return False
-        # if class_name is ZeroLayer, return False
-        #
-
 '''
     输出全 0 的“空操作层”
 '''
@@ -584,3 +584,215 @@ class ZeroLayer(MyModule):
     @staticmethod
     def is_zero_layer():
         return True
+
+################## 新增 ##################
+# ResNetBlock
+class ResNetBlock(MyModule):
+    """标准 ResNet BasicBlock，支持 stride>1，通过 1x1 shortcut 对齐形状。"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBlock, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.kernel_size = 3
+        self.expand_ratio = 1
+        self.conv1 = ConvLayer(in_channels, out_channels, kernel_size=3, stride=stride, act_func='relu6')
+        self.conv2 = ConvLayer(out_channels, out_channels, kernel_size=3, stride=1, act_func=None)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = ConvLayer(
+                in_channels, out_channels, kernel_size=1, stride=stride, use_bn=True, act_func=None
+            )
+        else:
+            self.shortcut = IdentityLayer(in_channels, out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + identity
+        return self.act(out)
+
+    def get_flops(self, x):
+        flop1, out1 = self.conv1.get_flops(x)
+        flop2, out2 = self.conv2.get_flops(out1)
+        flop_sc, _ = self.shortcut.get_flops(x)
+        out = out2 + self.shortcut(x)
+        return flop1 + flop2 + flop_sc, out
+
+    @staticmethod
+    def is_zero_layer():
+        return False
+
+    @property
+    def module_str(self):
+        return f"ResNetBlock(k3_s{self.stride}_c{self.out_channels})"
+
+    @property
+    def config(self):
+        return {
+            "name": self.__class__.__name__,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "stride": self.stride,
+        }
+
+    @staticmethod
+    def build_from_config(config):
+        return ResNetBlock(
+            in_channels=config.get("in_channels"),
+            out_channels=config.get("out_channels"),
+            stride=config.get("stride", 1),
+        )
+
+class DenseNetBlock(MyModule):
+    """轻量 DenseNet block：堆叠若干层后用 1x1 conv 压缩，并可选下采样。"""
+    def __init__(self, in_channels, out_channels, stride=1, growth_rate=12, num_layers=6):
+        super(DenseNetBlock, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.kernel_size = 3
+        self.expand_ratio = 1
+        self.layers = nn.ModuleList()
+        cur_channels = in_channels
+        for _ in range(num_layers):
+            self.layers.append(
+                ConvLayer(cur_channels, growth_rate, kernel_size=3, stride=1, act_func='relu6')
+            )
+            cur_channels += growth_rate
+        self.transition = ConvLayer(cur_channels, out_channels, kernel_size=1, stride=1, act_func=None)
+        self.downsample = nn.Identity() if stride == 1 else nn.AvgPool2d(kernel_size=stride, stride=stride)
+
+    def forward(self, x):
+        features = x
+        for layer in self.layers:
+            new_feat = layer(features)
+            features = torch.cat([features, new_feat], dim=1)
+        out = self.transition(features)
+        out = self.downsample(out)
+        return out
+
+    def get_flops(self, x):
+        total_flop = 0
+        features = x
+        for layer in self.layers:
+            flop, new_feat = layer.get_flops(features)
+            total_flop += flop
+            features = torch.cat([features, new_feat], dim=1)
+        flop_trans, out = self.transition.get_flops(features)
+        total_flop += flop_trans
+        out = self.downsample(out)
+        # downsample (avgpool) FLOPs 近似为 0，这里忽略
+        return total_flop, out
+
+    @staticmethod
+    def is_zero_layer():
+        return False
+
+    @property
+    def module_str(self):
+        return f"DenseNetBlock(k3_layers{len(self.layers)}_growth{self.layers[0].out_channels}_s{self.stride}_out{self.out_channels})"
+
+    @property
+    def config(self):
+        return {
+            "name": self.__class__.__name__,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "stride": self.stride,
+            "growth_rate": self.layers[0].out_channels if len(self.layers) > 0 else None,
+            "num_layers": len(self.layers),
+        }
+
+    @staticmethod
+    def build_from_config(config):
+        return DenseNetBlock(
+            in_channels=config.get("in_channels"),
+            out_channels=config.get("out_channels"),
+            stride=config.get("stride", 1),
+            growth_rate=config.get("growth_rate", 12),
+            num_layers=config.get("num_layers", 6),
+        )
+
+class SqueezeExcitation(MyModule):
+    def __init__(self, channels, reduction=4):
+        super(SqueezeExcitation, self).__init__()
+        squeeze_channels = max(1, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, squeeze_channels, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(squeeze_channels, channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        scale = self.fc(self.avg_pool(x))
+        return x * scale
+
+class SEBlock(MyModule):
+    """3x3 两层卷积 + SE + 残差"""
+    def __init__(self, in_channels, out_channels, stride=1, reduction=4):
+        super(SEBlock, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.kernel_size = 3
+        self.expand_ratio = 1
+        self.conv1 = ConvLayer(in_channels, out_channels, kernel_size=3, stride=stride, act_func='relu6')
+        self.conv2 = ConvLayer(out_channels, out_channels, kernel_size=3, stride=1, act_func=None)
+        self.se = SqueezeExcitation(out_channels, reduction)
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = ConvLayer(
+                in_channels, out_channels, kernel_size=1, stride=stride, use_bn=True, act_func=None
+            )
+        else:
+            self.shortcut = IdentityLayer(in_channels, out_channels)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.se(out)
+        out = out + identity
+        return self.act(out)
+
+    def get_flops(self, x):
+        flop1, out1 = self.conv1.get_flops(x)
+        flop2, out2 = self.conv2.get_flops(out1)
+        # SE 部分 FLOPs 估计（两个 1x1 conv）
+        n, c, h, w = out2.size()
+        squeeze_c = max(1, c // self.se.fc[0].out_channels) if hasattr(self.se.fc[0], "out_channels") else max(1, c // 4)
+        se_flop = c * h * w  # global avg
+        se_flop += c * squeeze_c + squeeze_c * c  # 两个 1x1 conv 近似
+        out = self.se(out2)
+        flop_sc, _ = self.shortcut.get_flops(x)
+        out = out + self.shortcut(x)
+        return flop1 + flop2 + se_flop + flop_sc, self.act(out)
+
+    @staticmethod
+    def is_zero_layer():
+        return False
+
+    @property
+    def module_str(self):
+        return f"SEBlock(k3_s{self.stride}_c{self.out_channels})"
+
+    @property
+    def config(self):
+        return {
+            "name": self.__class__.__name__,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "stride": self.stride,
+        }
+
+    @staticmethod
+    def build_from_config(config):
+        return SEBlock(
+            in_channels=config.get("in_channels"),
+            out_channels=config.get("out_channels"),
+            stride=config.get("stride", 1),
+        )

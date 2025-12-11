@@ -44,7 +44,9 @@ class SimpleReplayBuffer:
         # 随机删除直至容量限制
         self._rebalance_to_capacity()
 
-    def sample(self, k: int, mode: str = "global", exclude_task: int = None):
+    def sample(self, k: int, mode: str = "global", exclude_task: int = None,
+               current_task: int = None, old_task_scale: float = 1.0,
+               forgetting_map: dict = None, old_task_scale_by_f: float = 0.0):
         if self.capacity <= 0 or len(self.storage) == 0 or k <= 0:
             return None, None
         mode = (mode or "global").lower()
@@ -74,12 +76,20 @@ class SimpleReplayBuffer:
             ys = torch.stack([e["y"] for e in sampled], dim=0)
             return xs, ys
         elif mode == "age_priority":
-            # 按样本“年龄”加权采样，越早的样本权重越高
+            # 按样本“年龄”加权采样，可对旧任务/高遗忘任务放大权重
             now = self._time if self._time > 0 else len(candidates)
             weights = []
+            f_map = forgetting_map or {}
             for e in candidates:
                 age = max(1, now - int(e.get("t", 0)) + 1)
-                weights.append(float(age))
+                task_id = int(e.get("task", -1))
+                scale = 1.0
+                if current_task is not None and task_id != int(current_task):
+                    scale *= float(old_task_scale)
+                    # 按遗忘度进一步放大，F 为百分比点，简单线性放大
+                    if old_task_scale_by_f > 0 and task_id in f_map:
+                        scale *= 1.0 + float(old_task_scale_by_f) * max(0.0, float(f_map[task_id])) / 100.0
+                weights.append(float(age) * float(scale))
             take = min(k, len(candidates))
             sampled = random.choices(candidates, weights=weights, k=take)
             xs = torch.stack([e["x"] for e in sampled], dim=0)
@@ -123,6 +133,44 @@ class SimpleReplayBuffer:
             t = int(item.get("task", -1))
             hist[t] = hist.get(t, 0) + 1
         return hist
+
+    def export_state(self):
+        """序列化到 CPU，便于跨任务/断点恢复。"""
+        return {
+            "capacity": int(self.capacity),
+            "time": int(self._time),
+            "storage": [
+                {
+                    "x": e["x"].cpu(),
+                    "y": e["y"].cpu(),
+                    "task": int(e.get("task", -1)),
+                    "t": int(e.get("t", 0)),
+                }
+                for e in self.storage
+            ],
+        }
+
+    def load_state(self, state: dict):
+        """从 export_state 恢复；容量按当前 buffer 的 capacity 限制。"""
+        if not state:
+            return
+        self.capacity = max(0, int(state.get("capacity", self.capacity)))
+        self._time = int(state.get("time", 0))
+        storage = []
+        for e in state.get("storage", []):
+            try:
+                storage.append(
+                    {
+                        "x": e["x"].clone().cpu(),
+                        "y": e["y"].clone().cpu(),
+                        "task": int(e.get("task", -1)),
+                        "t": int(e.get("t", 0)),
+                    }
+                )
+            except Exception:
+                continue
+        self.storage = storage
+        self._rebalance_to_capacity()
 
 """
     RunConfig:运行配置基类
@@ -316,8 +364,6 @@ class RunConfig(object):
 """
     RunManager:运行管理基类
 """
-
-
 class RunManager:
 
     def __init__(
@@ -422,6 +468,8 @@ class RunManager:
         self.replay_mode = str(getattr(run_config, "replay_mode", "none")).lower()
         self.replay_capacity = int(getattr(run_config, "replay_capacity", 0))
         self.replay_per_batch = int(getattr(run_config, "replay_per_batch", 0))
+        self.replay_old_task_scale = float(getattr(run_config, "replay_old_task_scale", 1.0))
+        self.replay_old_task_scale_by_f = float(getattr(run_config, "replay_old_task_scale_by_F", 0.0))
         if replay_buffer is not None:
             replay_buffer.set_capacity(self.replay_capacity)
             self.replay_buffer = replay_buffer
@@ -628,8 +676,7 @@ class RunManager:
             self.rwalk_path_score = {
                 k: torch.zeros_like(v) for k, v in fisher_dict.items()
             }
-            
-                
+                          
     def load_ortho_state(self, state):
         """加载旧任务的正交参考梯度方向，state=None 时重置。
         会自动跳过当前网络中不存在或 shape 不匹配的参数（兼容不同 backbone）。"""
@@ -663,7 +710,6 @@ class RunManager:
         else:
             self.prev_kd_grads = None
             self.prev_kd_grads_history = []
-
 
     def export_ortho_state(self):
         """导出当前累积的正交参考梯度方向."""
@@ -801,8 +847,7 @@ class RunManager:
         for name in grad_acc:
             grad_acc[name] /= float(processed)
         return grad_acc
-
-        
+  
     def set_teacher(self, teacher_model):
         """设置上一任务的 teacher 模型，用于 KD / 正交更新."""
         if teacher_model is None:
@@ -817,7 +862,6 @@ class RunManager:
             teacher_model = teacher_model.to(self.device)
         teacher_model.eval()
         self.teacher_model = teacher_model
-
 
     @property
     def save_path(self):
@@ -837,8 +881,6 @@ class RunManager:
         return self._logs_path
 
     """ net info """
-
-    # noinspection PyUnresolvedReferences
     def net_flops(self):
         data_shape = [1] + list(self.run_config.data_provider.data_shape)
 
@@ -1026,7 +1068,6 @@ class RunManager:
             fout.write(json.dumps(net_info, indent=4) + "\n")
 
     """ save and load models """
-
     def save_model(
         self, checkpoint=None, is_best=False, model_name=None, HardwareClass=None
     ):
@@ -1164,16 +1205,15 @@ class RunManager:
     """ train and test """
     def write_log(self, log_str, prefix, should_print=True):
         """prefix: valid, test"""
+        log_file = None
         if prefix in ["valid", "test"]:
-            with open(os.path.join(self.logs_path, "test_console.txt"), "a") as fout:
+            log_file = "test_console.txt"
+        elif prefix == "train":
+            log_file = "train_console.txt"
+        if log_file is not None:
+            with open(os.path.join(self.logs_path, log_file), "a") as fout:
                 fout.write(log_str + "\n")
                 fout.flush()
-        # if prefix in ["valid", "test", "train"]:
-        #     with open(os.path.join(self.logs_path, "train_console.txt"), "a") as fout:
-        #         if prefix in ["valid", "test"]:
-        #             fout.write("=" * 10)
-        #         fout.write(log_str + "\n")
-        #         fout.flush()
         if should_print:
             print(log_str)
 
@@ -1268,6 +1308,8 @@ class RunManager:
             f_max = max(f_dict.values()) if f_dict else 0.0
             f_str = ", ".join([f"T{t}:{v:.2f}" for t, v in sorted(f_dict.items())])
             self.write_log(f"forgetting_F_max: {f_max:.2f}; per_task_F: {f_str}", prefix="test", should_print=True)
+            # 记录供采样使用的最新遗忘表
+            self.task_forgetting = f_dict
         else:
             self.last_task_acc = None
 
@@ -1344,6 +1386,10 @@ class RunManager:
                     self.replay_per_batch,
                     mode=self.replay_mode,
                     exclude_task=None if self.replay_mode == "global" else None,
+                    current_task=self.task_id,
+                    old_task_scale=self.replay_old_task_scale,
+                    forgetting_map=getattr(self, "task_forgetting", None),
+                    old_task_scale_by_f=self.replay_old_task_scale_by_f,
                 )
                 if rep_x is not None and rep_y is not None and rep_x.numel() > 0:
                     rep_x = rep_x.to(self.device, non_blocking=True)
@@ -1767,7 +1813,6 @@ class RunManager:
         if self.ortho_kd_history_max > 0 and len(self.prev_kd_grads_history) > self.ortho_kd_history_max:
             self.prev_kd_grads_history = self.prev_kd_grads_history[-self.ortho_kd_history_max:]
 
-
     def train_run_manager(
         self,
         start_local_epoch=None,
@@ -1868,12 +1913,9 @@ class RunManager:
 
     print("CifarRunConfig初始化完成...")
 
-
 """
     CifarRunManager:cifar数据集的运行配置类
 """
-
-
 class CifarRunConfig(RunConfig):
 
     def __init__(

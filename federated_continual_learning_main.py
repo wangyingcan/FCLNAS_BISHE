@@ -244,7 +244,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ortho_samples_per_task",type=int,default=2048,help="估计旧任务梯度方向时使用的样本上限，0 表示不估计（禁用正交基更新）",)
     parser.add_argument("--replay_mode", type=str, default="none", choices=["none", "global", "task_balanced", "age_priority"], help="experience replay 模式：none/global/task_balanced/age_priority")
     parser.add_argument("--replay_capacity", type=int, default=0, help="重放缓冲区最大样本量（全局计数）")
+    parser.add_argument("--replay_capacity_ratio", type=float, default=None, help="按全训练集样本数的比例设置缓冲区容量（0~1），高于 replay_capacity 时覆盖之")
     parser.add_argument("--replay_per_batch", type=int, default=0, help="每个 batch 从缓冲区重放的样本数")
+    parser.add_argument("--replay_old_task_scale", type=float, default=1.0, help="age_priority 模式下旧任务样本的权重缩放，>1 让旧任务更容易被采样")
+    parser.add_argument("--replay_old_task_scale_by_F", type=float, default=0.0, help="按遗忘程度动态放大旧任务样本权重，0 表示不启用，单位：每个遗忘点数的放大系数")
     
     
     # 分阶段可选覆盖：search_* 用于超网预热/搜索，retrain_* 用于重训；未提供则回落到上述全局参数
@@ -264,7 +267,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--search_cl_penalty_clip", type=float, default=None)
     parser.add_argument("--search_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
     parser.add_argument("--search_replay_capacity", type=int, default=None)
+    parser.add_argument("--search_replay_capacity_ratio", type=float, default=None)
     parser.add_argument("--search_replay_per_batch", type=int, default=None)
+    parser.add_argument("--search_replay_old_task_scale", type=float, default=None)
+    parser.add_argument("--search_replay_old_task_scale_by_F", type=float, default=None)
     
     parser.add_argument("--retrain_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
     parser.add_argument("--retrain_cl_ortho_scale", type=float, default=None)
@@ -282,7 +288,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrain_cl_penalty_clip", type=float, default=None)
     parser.add_argument("--retrain_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
     parser.add_argument("--retrain_replay_capacity", type=int, default=None)
+    parser.add_argument("--retrain_replay_capacity_ratio", type=float, default=None)
     parser.add_argument("--retrain_replay_per_batch", type=int, default=None)
+    parser.add_argument("--retrain_replay_old_task_scale", type=float, default=None)
+    parser.add_argument("--retrain_replay_old_task_scale_by_F", type=float, default=None)
     
 
     parser.add_argument("--local_epoch_number", default=5, type=int, help="local epoch each round in fed_search,during each epoch all data will be trained once")
@@ -335,6 +344,8 @@ def parse_args() -> argparse.Namespace:
     # architecture search config
     parser.add_argument("--arch_algo", type=str, default="grad", choices=["grad", "rl"],help="architecture search algorithm")
     parser.add_argument("--warmup_n_rounds", type=int, default=5, help="warmup rounds to pretrain supernet before architecture search")
+    parser.add_argument("--arch_replay_lambda", type=float, default=0.0,
+                        help="weight for replay loss when updating architecture parameters (gradient/RL search)")
     parser.add_argument("--kd_lambda", type=float, default=0.0,
                         help="distillation loss weight; 0 disables KD, 0.5 means CE/KD各占一半")
     parser.add_argument("--kd_temperature", type=float, default=2.0,
@@ -402,7 +413,10 @@ def parse_args() -> argparse.Namespace:
             "cl_penalty_clip",
             "replay_mode",
             "replay_capacity",
+            "replay_capacity_ratio",
             "replay_per_batch",
+            "replay_old_task_scale",
+            "replay_old_task_scale_by_F",
         ]
     }
 
@@ -410,7 +424,7 @@ def parse_args() -> argparse.Namespace:
     args.n_epochs = args.local_epoch_number * (args.last_round - args.start_round)
 
     # 构建保存目录名（原文件两次赋值，合并为等价流程，行为不变）
-    base_path = "./output_test2/fednas-" + args.arch_algo + str(args.manual_seed)
+    base_path = "./output_test3/fednas-" + args.arch_algo + str(args.manual_seed)
     if args.target_hardware is not None:
         base_path += args.target_hardware
     args.path = base_path + str(args.n_cell_stages)
@@ -434,9 +448,25 @@ def main():
             setattr(args, k, base_val if override_val is None else override_val)
             
     def _attach_replay_cfg(run_cfg, a):
-        """将回放相关超参挂到 run_config 上，便于 RunManager 读取。"""
-        for k in ["replay_mode", "replay_capacity", "replay_per_batch"]:
+        """将回放相关超参挂到 run_config 上，便于 RunManager 读取；支持按全训练集比例设定容量。"""
+        for k in ["replay_mode", "replay_capacity", "replay_per_batch", "replay_old_task_scale", "replay_old_task_scale_by_F"]:
             setattr(run_cfg, k, getattr(a, k, None))
+        ratio = getattr(a, "replay_capacity_ratio", None)
+        if ratio is not None:
+            try:
+                # 以“全训练集”估算：对 CIFAR10/100 使用 50k，并按客户端数量近似均分；否则退回当前任务 * num_tasks
+                ds_lower = str(getattr(run_cfg, "dataset", "")).lower()
+                if "cifar" in ds_lower:
+                    total = 45000  # CIFAR-10/100 训练集规模
+                    num_clients = max(1, int(getattr(run_cfg, "num_clients", 1)))
+                    base = total // num_clients
+                else:
+                    base = run_cfg.data_provider.trn_set_length * getattr(run_cfg, "num_tasks", 1)
+                cap = int(max(0, base * ratio))
+                run_cfg.replay_capacity = cap
+                print(f"[Replay] set capacity by ratio={ratio} -> {cap} (total_train≈{base})")
+            except Exception as e:
+                print(f"[Replay] failed to apply replay_capacity_ratio={ratio}: {e}")
 
     # 创建实验环境目录；保持异常可见
     try:
@@ -467,6 +497,36 @@ def main():
     # 跨任务共享的 replay buffer（按 client 索引），避免每个任务重建导致忘记旧样本
     replay_buffers_across_tasks = [None for _ in range(args.num_users)]
 
+    def _load_replay_buffers(task_path: str):
+        """从上一任务目录加载 replay buffer 状态，供断点续跑/跨任务继承。"""
+        buf_path = os.path.join(task_path, "replay_buffers.pt")
+        if not os.path.isfile(buf_path):
+            return
+        try:
+            states = torch.load(buf_path, map_location="cpu")
+            if isinstance(states, list):
+                for idx, st in enumerate(states):
+                    if st is None:
+                        continue
+                    buf = SimpleReplayBuffer(capacity=st.get("capacity", 0))
+                    buf.load_state(st)
+                    replay_buffers_across_tasks[idx] = buf
+                print(f"[Replay] Loaded replay buffers from {buf_path}")
+        except Exception as e:
+            print(f"[Replay] Failed to load replay buffers from {buf_path}: {e}")
+
+    def _save_replay_buffers(task_path: str):
+        """将当前 replay buffer 状态保存到任务目录，便于下一任务/断点续跑。"""
+        buf_path = os.path.join(task_path, "replay_buffers.pt")
+        states = []
+        for buf in replay_buffers_across_tasks:
+            states.append(buf.export_state() if buf is not None else None)
+        try:
+            torch.save(states, buf_path)
+            print(f"[Replay] Saved replay buffers to {buf_path}")
+        except Exception as e:
+            print(f"[Replay] Failed to save replay buffers to {buf_path}: {e}")
+
     # 遍历所有任务
     base_task_path = args.path
     for task_id in range(args.start_task_id, args.num_tasks + 1):
@@ -485,6 +545,9 @@ def main():
             pass
         # 尝试继承上一任务的超网权重
         prev_task_path = base_task_path + f"-task{task_id - 1}"
+        # 断点续跑 / 非首任务：尝试加载上一任务的 replay buffer
+        if args.start_task_id != 1 and replay_buffers_across_tasks.count(None) == len(replay_buffers_across_tasks):
+            _load_replay_buffers(prev_task_path)
 
         # 组装 run_config
         args.lr_schedule_param = None
@@ -520,6 +583,7 @@ def main():
         # ]
         
         args.conv_candidates = [
+            'ResNetBlock','DenseNetBlock','SEBlock',
             '3x3_MBConv1', '3x3_MBConv2', '3x3_MBConv3', '3x3_MBConv4', '3x3_MBConv5', '3x3_MBConv6',
             '5x5_MBConv1', '5x5_MBConv2', '5x5_MBConv3', '5x5_MBConv4', '5x5_MBConv5', '5x5_MBConv6',
             '7x7_MBConv1', '7x7_MBConv2', '7x7_MBConv3', '7x7_MBConv4', '7x7_MBConv5', '7x7_MBConv6'
@@ -685,7 +749,14 @@ def main():
             _apply_phase_overrides("search")
             # teacher：上一任务固化子网，用于 supernet KD / kd_ortho
             super_teacher_model = None
-            need_super_teacher = args.cl_kd_logit_lambda > 0 or args.cl_ortho_method == "kd_ortho"
+            # 启用 KD / 正交 / 权重锚定(EWC) 任一项，都需要上一任务 teacher
+            need_super_teacher = (
+                args.cl_kd_logit_lambda > 0
+                or args.cl_ortho_method == "kd_ortho"
+                or args.reg_lambda > 0
+                or args.reg_use_ewc
+                or args.ewc_lambda > 0
+            )
             if need_super_teacher and task_id > 1:
                 try:
                     # Teacher 使用上一任务的超网 checkpoint（global/warmup），而非 learned 子网
@@ -774,6 +845,10 @@ def main():
                     else:
                         print(f"[Supernet] Ortho ref is None (processed={processed}), skip ortho save")
                 print("完成super_net训练阶段")
+                # 保存本阶段的 replay buffer，便于断点续跑/下一任务复用
+                for idx, cli in enumerate(clients):
+                    replay_buffers_across_tasks[idx] = getattr(cli.run_manager, "replay_buffer", None)
+                _save_replay_buffers(args.path)
                 
                 # 二、固化子网阶段
                 global_server.load_model()
@@ -783,6 +858,7 @@ def main():
             # 三、子网重训阶段
             # 重训阶段可选覆盖
             _apply_phase_overrides("retrain")
+            current_task_path = args.path  # 记录本任务根目录，便于重训结束后保存 replay
             retrain_path = args.path + '/learned_net'
             # 如果跳过 search，但 learned_net 不存在，则尝试用当前 global_server 固化出子网
             if args.skip_search and not os.path.exists(os.path.join(retrain_path, "net.config")):
@@ -999,6 +1075,7 @@ def main():
             # 记录当前任务后每个客户端的 replay buffer，供下一任务复用
             for idx, rm in enumerate(clients):
                 replay_buffers_across_tasks[idx] = rm.replay_buffer
+            _save_replay_buffers(current_task_path)
 
         elif args.object_to_search == "baseline":
             print(line_info()); print("-----------------------------case baseline: fixed backbone--------------------------------")
@@ -1133,6 +1210,7 @@ def main():
             # 记录当前任务的 replay buffer，供下一任务复用
             for idx, rm in enumerate(clients):
                 replay_buffers_across_tasks[idx] = rm.replay_buffer
+            _save_replay_buffers(args.path)
             
             # 保存 EWC 正则化模型
             if args.ewc_lambda > 0:

@@ -1,0 +1,50 @@
+/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:16: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml
+CifarRunConfig初始化完成...
+CifarRunConfig初始化完成...
+SuperProxylessNASNets初始化完成...
+set格式化参数开始...
+set格式化参数结束...
+Experiment dir : env_dir/search-grad-128-None-20251211-202756
+>>> 实际使用的物理 GPU UUID: GPU-552ecc6d-cbc5-ec48-f093-59b68b0db6d7
+开始执行任务 1/10
+CifarRunConfig初始化开始... is_client=True client_id=0
+SuperProxylessNASNets初始化开始...
+CifarRunConfig初始化开始... is_client=False client_id=0
+[Replay] set capacity by ratio=0.2 -> 9000 (total_train≈45000)
+RunManager初始化开始...
+Total training params: 57.62M
+Total FLOPs: 56.4M
+Measure latency for types: None
+The global_server user has 4500 training data, 500 valid data and 1000 test data.
+[/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:684]
+GradientArchSearchConfig
+SuperProxylessNASNets初始化开始...
+RunManager初始化开始...
+Total training params: 57.62M
+Total FLOPs: 56.4M
+Measure latency for types: None
+[Replay] set capacity by ratio=0.2 -> 9000 (total_train≈45000)
+0 client has 4500 training data, 500 valid data and 1000 test data.
+-----------------------------------------------------case1: training super_net-----------------------------------------------------
+[Supernet] fresh task1 run, skip loading existing ewc/ortho state
+tensorboardX logdir ./output_test1/fednas-grad02,3,4,3,4,3-task1/tensorboard
+len(self.clients_idx_arr):  1
+2025-12-11 20:28:27
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+/home/wyc/code/FCLNAS_BISHE/federated_continual_learning_main.py:16: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估
+搜索阶段使用验证集进行精度评估

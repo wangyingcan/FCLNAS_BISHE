@@ -2,6 +2,7 @@
 # Han Cai, Ligeng Zhu, Song Han
 # International Conference on Learning Representations (ICLR), 2019.
 import logging
+import os
 import torch.nn.functional as F
 from run_manager import *
 
@@ -263,6 +264,227 @@ class ArchSearchRunManager:
         if should_logging_info:
             logging.info(log_str)
 
+    # --------- 公共小工具：蒸馏/正则/正交的准备与复用 --------- #
+    def _prepare_distill_model(self, teacher_model):
+        if teacher_model is None:
+            return None
+        model = copy.deepcopy(teacher_model)
+        if isinstance(model, nn.DataParallel):
+            model = model.module
+        model = model.to(self.run_manager.device)
+        model.eval()
+        try:
+            self.run_manager.write_log(
+                f"[KD] task{self.task_id} teacher prepared: cls={model.__class__.__name__}",
+                prefix="train",
+                should_print=True,
+            )
+        except Exception:
+            pass
+        return model
+
+    def _prepare_reg_anchor(self, teacher_model, reg_lambda, reg_use_ewc):
+        anchor_params = None
+        fisher = None
+        if teacher_model is None or reg_lambda <= 0:
+            return anchor_params, fisher
+        reg_model = copy.deepcopy(teacher_model)
+        if isinstance(reg_model, nn.DataParallel):
+            reg_model = reg_model.module
+        reg_model = reg_model.to(self.run_manager.device)
+        reg_model.eval()
+        # 调试：记录 teacher 参数规模，便于确认是否为空
+        try:
+            total_params = sum(1 for _ in reg_model.named_parameters() if _.requires_grad)
+            self.run_manager.write_log(
+                f"[REG] task{self.task_id} teacher_cls={reg_model.__class__.__name__}, "
+                f"trainable_params={total_params}",
+                prefix="train",
+                should_print=True,
+            )
+        except Exception:
+            pass
+        anchor_params = {}
+        for name, p in reg_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            norm_name = name.replace("module.", "", 1)
+            anchor_params[norm_name] = p.detach().clone()
+        # 若未匹配到任何参数，尝试用 teacher state_dict 与当前模型做交集兜底
+        if len(anchor_params) == 0:
+            try:
+                sd = reg_model.state_dict()
+                for name, p in self.run_manager.net.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    norm_name = name.replace("module.", "", 1)
+                    if norm_name in sd and sd[norm_name].shape == p.shape:
+                        anchor_params[norm_name] = sd[norm_name].detach().clone()
+            except Exception:
+                pass
+        print(
+            f"[REG] task{self.task_id} enable weight anchoring: "
+            f"anchor_params={len(anchor_params)}, reg_lambda={reg_lambda}"
+        )
+        if reg_use_ewc:
+            fisher = {}
+            sample_loader = list(self.run_manager.run_config.train_loader)
+            if len(sample_loader) > 0:
+                imgs, labels = sample_loader[0]
+                imgs, labels = imgs.to(self.run_manager.device), labels.to(self.run_manager.device)
+                reg_model.zero_grad()
+                out = reg_model(imgs)
+                ce = F.cross_entropy(out, labels)
+                ce.backward()
+                for name, p in reg_model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    norm_name = name.replace("module.", "", 1)
+                    if p.grad is None:
+                        continue
+                    fisher[norm_name] = p.grad.detach().pow(2)
+            print(f"[REG] task{self.task_id} EWC fisher entries={len(fisher)}")
+        return anchor_params, fisher
+
+    def _compute_kd_ortho_reference_from_loss(self, kd_loss):
+        """利用当前 kd_loss 反向得到梯度参考，不改变现有梯度状态。"""
+        if kd_loss is None:
+            return None
+        self.run_manager.optimizer.zero_grad()
+        self.run_manager.net.zero_grad()
+        kd_loss.backward(retain_graph=True)
+        ref = {}
+        for name, p in self.run_manager.net.named_parameters():
+            if p.grad is not None and p.requires_grad:
+                ref[name] = p.grad.detach().clone()
+        self.run_manager.optimizer.zero_grad()
+        self.run_manager.net.zero_grad()
+        return ref
+
+    def _maybe_build_kd_ortho_ref(self, distill_model, eff_kd_lambda, ortho_samples_per_task):
+        """预构建 kd_ortho 的全局参考梯度，保持与 RunManager 逻辑一致。"""
+        if (
+            self.run_manager.cl_ortho_method == "kd_ortho"
+            and distill_model is not None
+            and eff_kd_lambda > 0
+            and ortho_samples_per_task is not None
+            and ortho_samples_per_task > 0
+        ):
+            return self.run_manager.build_kd_ortho_reference(
+                max_samples=ortho_samples_per_task
+            )
+        return None
+
+    def _build_total_loss_for_search(
+        self,
+        output,
+        labels,
+        teacher_output,
+        eff_kd_method,
+        eff_kd_lambda,
+        eff_kd_temperature,
+        eff_kd_conf,
+        reg_anchor_params,
+        reg_lambda,
+        fisher_params,
+        cl_penalty_clip,
+    ):
+        """封装 search 阶段的 CE + KD + EWC/锚定，总逻辑与原实现一致。"""
+        # 基础 CE
+        if self.run_manager.run_config.label_smoothing > 0:
+            ce_loss = cross_entropy_with_label_smoothing(
+                output, labels, self.run_manager.run_config.label_smoothing
+            )
+        else:
+            ce_loss = self.run_manager.criterion(output, labels)
+
+        # EWC 正则（如果有历史 Fisher）
+        ewc_penalty = self.run_manager._ewc_penalty()
+
+        # KD
+        kd_loss = None
+        if teacher_output is not None and eff_kd_method in ["logit", "logit_conf"] and eff_kd_lambda > 0:
+            T = eff_kd_temperature if eff_kd_temperature is not None else 1.0
+            student_logp = F.log_softmax(output / T, dim=1)
+            teacher_prob = F.softmax(teacher_output / T, dim=1)
+            if eff_kd_method == "logit":
+                kd_loss = F.kl_div(student_logp, teacher_prob, reduction="batchmean") * (T * T)
+            else:
+                mask = (teacher_prob > eff_kd_conf).float()
+                if mask.sum() > 0:
+                    log_teacher = torch.log(teacher_prob + 1e-12)
+                    kl_elem = (teacher_prob * (log_teacher - student_logp)) * mask
+                    kd_loss = (kl_elem.sum() / mask.sum()) * (T * T)
+
+        # 权重锚定正则（可选 Fisher 权重）
+        reg_loss = None
+        if reg_anchor_params is not None and reg_lambda > 0:
+            reg_loss = 0.0
+            skipped = 0
+            matched = 0
+            for name, p in self.run_manager.net.named_parameters():
+                if not p.requires_grad:
+                    continue
+                norm_name = name.replace("module.", "", 1)
+                anchor = reg_anchor_params.get(norm_name)
+                if anchor is None or anchor.shape != p.shape:
+                    skipped += 1
+                    continue
+                weight = fisher_params.get(norm_name, 1.0) if fisher_params is not None else 1.0
+                if torch.is_tensor(weight):
+                    weight = weight.mean().item()
+                reg_loss = reg_loss + weight * (p - anchor).pow(2).sum()
+                matched += 1
+            print(
+                f"[REG] task{self.task_id} matched={matched}, skipped={skipped}, "
+                f"fisher_used={len(fisher_params) if fisher_params is not None else 0}"
+            )
+            if matched == 0 and getattr(self, "_reg_warned", False) is False:
+                try:
+                    self.run_manager.write_log(
+                        f"[REG] task{self.task_id} anchor matched 0 (reg_lambda={reg_lambda}); "
+                        f"teacher may be None or name mismatch",
+                        prefix="train",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
+                self._reg_warned = True
+                
+            # 额外调试：若完全未匹配，打印部分 anchor / 当前参数名以排查名称不一致
+            if matched == 0 and not getattr(self, "_reg_debug_logged", False):
+                try:
+                    anchor_keys = list(reg_anchor_params.keys())[:5] if reg_anchor_params else []
+                    cur_keys = []
+                    for n, _ in self.run_manager.net.named_parameters():
+                        cur_keys.append(n.replace("module.", "", 1))
+                        if len(cur_keys) >= 5:
+                            break
+                    self.run_manager.write_log(
+                        f"[REG] task{self.task_id} debug: anchor_keys(sample)={anchor_keys}, "
+                        f"cur_param_keys(sample)={cur_keys}",
+                        prefix="train",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
+                self._reg_debug_logged = True
+
+        total_loss = ce_loss
+        if kd_loss is not None and eff_kd_lambda > 0:
+            total_loss = total_loss + eff_kd_lambda * kd_loss
+        if ewc_penalty is not None and torch.isfinite(ewc_penalty):
+            penalty_term = self.run_manager.ewc_lambda * ewc_penalty
+            if cl_penalty_clip is not None:
+                penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
+            total_loss = total_loss + penalty_term
+        if reg_loss is not None and reg_lambda > 0:
+            penalty_term = reg_lambda * reg_loss
+            if cl_penalty_clip is not None:
+                penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
+            total_loss = total_loss + penalty_term
+        return total_loss, kd_loss, reg_loss, ewc_penalty
+
     def load_model(self, model_fname=None):
         latest_fname = os.path.join(self.run_manager.save_path, "latest.txt")
         if model_fname is None and os.path.exists(latest_fname):
@@ -380,7 +602,13 @@ class ArchSearchRunManager:
         cl_ortho_scale=1.0,
         ortho_samples_per_task=0,
         cl_penalty_clip=None,
+        arch_replay_lambda=0.0,
     ):
+        """
+        超网搜索阶段训练：可选固定权重/更新架构；支持 KD、EWC/锚定正则、正交约束。
+        先同步 server 权重与 teacher，再进入按 epoch/batch 的权重训练与架构更新。
+        """
+        # ------- 阶段 0：准备基础模型 -------
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
                 net_dict = self.net.state_dict()
@@ -391,15 +619,18 @@ class ArchSearchRunManager:
                 net_dict.update(server_model.state_dict())
                 self.net.load_state_dict(net_dict)
 
-        # teacher_model 用于跨任务蒸馏/锚定
-        distill_model = None
-        if teacher_model is not None:
-            distill_model = copy.deepcopy(teacher_model)
-            if isinstance(distill_model, nn.DataParallel):
-                distill_model = distill_model.module
-            distill_model = distill_model.to(self.run_manager.device)
-            distill_model.eval()
-        # baseline 风格的 KD 配置：优先 cl_kd_*，回退旧 kd_*
+        # ------- 阶段 1：准备 KD / 正则 辅助模型 -------
+        distill_model = self._prepare_distill_model(teacher_model)
+        if distill_model is None and not getattr(self, "_teacher_warned", False):
+            try:
+                self.run_manager.write_log(
+                    f"[KD] task{self.task_id} teacher_model is None, KD/REG/EWC may be skipped",
+                    prefix="train",
+                    should_print=True,
+                )
+            except Exception:
+                pass
+            self._teacher_warned = True
         eff_kd_lambda = cl_kd_lambda if cl_kd_lambda is not None else kd_lambda
         eff_kd_temperature = cl_kd_temperature if cl_kd_temperature is not None else kd_temperature
         eff_kd_method = (cl_kd_method or "none").lower()
@@ -409,50 +640,23 @@ class ArchSearchRunManager:
                 f"[KD] task{self.task_id} enable distillation: "
                 f"method={eff_kd_method}, lambda={eff_kd_lambda}, T={eff_kd_temperature}, conf={eff_kd_conf}"
             )
-        # reg_anchor_params/fisher_params 用于“权重锚定 + 可选 EWC”正则，避免跨任务漂移
-        reg_anchor_params = None
-        fisher_params = None
-
-        if teacher_model is not None and reg_lambda > 0:
-            reg_model = copy.deepcopy(teacher_model)
-            if isinstance(reg_model, nn.DataParallel):
-                reg_model = reg_model.module
-            reg_model = reg_model.to(self.run_manager.device)
-            reg_model.eval()
-            # 仅锚定可训练参数（不含 buffer），避免 shape 不一致
-            reg_anchor_params = {}
-            for name, p in reg_model.named_parameters():
-                if not p.requires_grad:
-                    continue
-                norm_name = name.replace("module.", "", 1)
-                reg_anchor_params[norm_name] = p.detach().clone()
-            print(
-                f"[REG] task{self.task_id} enable weight anchoring: "
-                f"anchor_params={len(reg_anchor_params)}, reg_lambda={reg_lambda}"
-            )
             
-            if reg_use_ewc:
-                # 可选：用 teacher 的首个 batch 近似 Fisher，对重要参数给予更大权重
-                fisher_params = {}
-                sample_loader = list(self.run_manager.run_config.train_loader)
-                if len(sample_loader) > 0:
-                    imgs, labels = sample_loader[0]
-                    imgs, labels = imgs.to(self.run_manager.device), labels.to(self.run_manager.device)
-                    reg_model.zero_grad()
-                    out = reg_model(imgs)
-                    ce = F.cross_entropy(out, labels)
-                    ce.backward()
-                    for name, p in reg_model.named_parameters():
-                        if not p.requires_grad:
-                            continue
-                        norm_name = name.replace("module.", "", 1)
-                        if p.grad is None:
-                            continue
-                        fisher_params[norm_name] = p.grad.detach().pow(2)
-                print(
-                    f"[REG] task{self.task_id} EWC fisher entries={len(fisher_params)}"
-                )
-
+        reg_anchor_params, fisher_params = self._prepare_reg_anchor(
+            teacher_model, reg_lambda, reg_use_ewc
+        )
+        # kd_ortho 全局参考梯度，与 RunManager 逻辑保持一致
+        kd_ortho_ref_grads = self._maybe_build_kd_ortho_ref(
+            distill_model, eff_kd_lambda, ortho_samples_per_task
+        )
+        # 架构更新时可选加入 replay 批次的 CE，偏向旧任务（默认关闭）
+        self.arch_replay_lambda = arch_replay_lambda
+        # 避免重复打印
+        self._arch_replay_logged = False
+        self._reg_warned = False
+        self._reg_debug_logged = False
+        self._teacher_warned = False
+        
+        # ------- 阶段 2：进入本地训练 -------
         data_loader = self.run_manager.run_config.train_loader
         data_loader = list(data_loader)
         nBatch = len(data_loader)
@@ -462,6 +666,17 @@ class ArchSearchRunManager:
         arch_param_num = len(list(self.net.architecture_parameters()))
         self.entropy = AverageMeter()
         update_schedule = self.arch_search_config.get_update_schedule(nBatch)
+        # 提醒：若只跑一轮且 arch_replay_lambda>0，会因为 epoch==0 跳过架构更新
+        if arch_replay_lambda > 0 and (last_local_epoch - start_local_epoch) <= 1:
+            try:
+                self.run_manager.write_log(
+                    f"[ArchReplay] task{self.task_id} arch updates will be skipped (epoch<=0); "
+                    f"arch_replay_lambda={arch_replay_lambda}",
+                    prefix="arch",
+                    should_print=True,
+                )
+            except Exception:
+                pass
         trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, arch_entropy = (
             None,
             None,
@@ -471,81 +686,8 @@ class ArchSearchRunManager:
             None,
             None,
         )
-        # kd_ortho 全局参考梯度，与 RunManager 逻辑保持一致
-        kd_ortho_ref_grads = None
-        if (
-            self.run_manager.cl_ortho_method == "kd_ortho"
-            and distill_model is not None
-            and eff_kd_lambda > 0
-            and ortho_samples_per_task > 0
-        ):
-            kd_ortho_ref_grads = self.run_manager.build_kd_ortho_reference(
-                max_samples=ortho_samples_per_task
-            )
-        # 小工具：计算本 batch 的各项损失，保持与 RunManager 中训练逻辑一致
-        def _build_total_loss(output, labels, teacher_output):
-            # 基础 CE
-            if self.run_manager.run_config.label_smoothing > 0:
-                ce_loss = cross_entropy_with_label_smoothing(
-                    output, labels, self.run_manager.run_config.label_smoothing
-                )
-            else:
-                ce_loss = self.run_manager.criterion(output, labels)
-            # EWC 正则（如果有历史 Fisher）
-            ewc_penalty = self.run_manager._ewc_penalty()
-            # KD
-            kd_loss = None
-            if teacher_output is not None and eff_kd_method in ["logit", "logit_conf"] and eff_kd_lambda > 0:
-                T = eff_kd_temperature if eff_kd_temperature is not None else 1.0
-                student_logp = F.log_softmax(output / T, dim=1)
-                teacher_prob = F.softmax(teacher_output / T, dim=1)
-                if eff_kd_method == "logit":
-                    kd_loss = F.kl_div(student_logp, teacher_prob, reduction="batchmean") * (T * T)
-                else:
-                    mask = (teacher_prob > eff_kd_conf).float()
-                    if mask.sum() > 0:
-                        log_teacher = torch.log(teacher_prob + 1e-12)
-                        kl_elem = (teacher_prob * (log_teacher - student_logp)) * mask
-                        kd_loss = (kl_elem.sum() / mask.sum()) * (T * T)
-            # 权重锚定正则（可选 Fisher 权重）
-            reg_loss = None
-            if reg_anchor_params is not None and reg_lambda > 0:
-                reg_loss = 0.0
-                skipped = 0
-                matched = 0
-                for name, p in self.run_manager.net.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    norm_name = name.replace("module.", "", 1)
-                    anchor = reg_anchor_params.get(norm_name)
-                    if anchor is None or anchor.shape != p.shape:
-                        skipped += 1
-                        continue
-                    weight = fisher_params.get(norm_name, 1.0) if fisher_params is not None else 1.0
-                    if torch.is_tensor(weight):
-                        weight = weight.mean().item()
-                    reg_loss = reg_loss + weight * (p - anchor).pow(2).sum()
-                    matched += 1
-                print(
-                    f"[REG] task{self.task_id} matched={matched}, skipped={skipped}, "
-                    f"fisher_used={len(fisher_params) if fisher_params is not None else 0}"
-                )
-
-            total_loss = ce_loss
-            if kd_loss is not None and eff_kd_lambda > 0:
-                total_loss = total_loss + eff_kd_lambda * kd_loss
-            if ewc_penalty is not None and torch.isfinite(ewc_penalty):
-                penalty_term = self.run_manager.ewc_lambda * ewc_penalty
-                if cl_penalty_clip is not None:
-                    penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
-                total_loss = total_loss + penalty_term
-            if reg_loss is not None and reg_lambda > 0:
-                penalty_term = reg_lambda * reg_loss
-                if cl_penalty_clip is not None:
-                    penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
-                total_loss = total_loss + penalty_term
-            return total_loss, kd_loss, reg_loss, ewc_penalty
-        
+        kd_ortho_cos = AverageMeter()  # 监控 kd_ortho 的梯度余弦相似度（仅 kd_ortho 场景）
+       
         for epoch in range(start_local_epoch, last_local_epoch):
             batch_time = AverageMeter()
             data_time = AverageMeter()
@@ -553,13 +695,11 @@ class ArchSearchRunManager:
             top1 = AverageMeter()
             top5 = AverageMeter()
             entropy = AverageMeter()
-            # 切换到训练模式；weight/arch 交替更新
             self.run_manager.net.train()
-
             end = time.time()
             for i, (images, labels) in enumerate(data_loader):
                 data_time.update((time.time() - end) / 60)
-                # lr
+                
                 lr = self.run_manager.run_config.adjust_learning_rate(
                     self.run_manager.optimizer, epoch, batch=i, nBatch=nBatch
                 )
@@ -571,7 +711,8 @@ class ArchSearchRunManager:
                     images, labels = images.cuda(non_blocking=True), labels.cuda(
                         non_blocking=True
                     )
-                    # 前向：随机 sample 二进制门，关闭未用模块加速
+                    
+                    # 抽样path
                     self.net.reset_binary_gates()  # random sample binary gates
                     self.net.unused_modules_off()  # remove unused module for speedup
                     output = self.run_manager.net(images)
@@ -581,8 +722,22 @@ class ArchSearchRunManager:
                     if distill_model is not None and eff_kd_lambda > 0 and eff_kd_method != "none":
                         with torch.no_grad():
                             teacher_output = distill_model(images)
+                            
                     # loss: CE + 可选 KD + 可选锚定正则
-                    total_loss, kd_loss, reg_loss, ewc_penalty = _build_total_loss(output, labels, teacher_output)
+                    total_loss, kd_loss, reg_loss, ewc_penalty = self._build_total_loss_for_search(
+                        output,
+                        labels,
+                        teacher_output,
+                        eff_kd_method,
+                        eff_kd_lambda,
+                        eff_kd_temperature,
+                        eff_kd_conf,
+                        reg_anchor_params,
+                        reg_lambda,
+                        fisher_params,
+                        cl_penalty_clip,
+                    )
+                    
                     # 正交更新（仅支持 kd_ortho，与 baseline 对齐）
                     old_grads = None
                     if (
@@ -594,58 +749,71 @@ class ArchSearchRunManager:
                         if kd_ortho_ref_grads is not None:
                             old_grads = {n: g.to(self.run_manager.device) for n, g in kd_ortho_ref_grads.items()}
                         else:
-                            self.run_manager.optimizer.zero_grad()
-                            self.run_manager.net.zero_grad()
-                            kd_loss.backward(retain_graph=True)
-                            old_grads = {}
-                            for name, p in self.run_manager.net.named_parameters():
-                                if p.grad is not None and p.requires_grad:
-                                    old_grads[name] = p.grad.detach().clone()
-                            self.run_manager.optimizer.zero_grad()
-                            self.run_manager.net.zero_grad()
+                            old_grads = self._compute_kd_ortho_reference_from_loss(kd_loss)
                         
                     # measure accuracy and record loss
                     acc1, acc5 = accuracy(output, labels, topk=(1, 5))
                     losses.update(total_loss.item(), images.size(0))
                     top1.update(acc1[0].item(), images.size(0))
                     top5.update(acc5[0].item(), images.size(0))
-                    # compute gradient and do SGD step
-                    self.run_manager.net.zero_grad()  # zero grads of weight_param, arch_param & binary_param
+                    
+                    self.run_manager.net.zero_grad() 
                     total_loss.backward()
+                    
                     # 若需要，投影梯度到 teacher 引导的正交子空间
                     if old_grads is not None:
                         eps = 1e-12
+                        num, denom_cos = 0.0, 0.0
                         for name, p in self.run_manager.net.named_parameters():
-                            if p.grad is None or name not in old_grads:
+                            if p.grad is None:
+                                continue
+                            # 兼容 DataParallel 前缀差异
+                            key = name
+                            if key not in old_grads:
+                                key = key.replace("module.", "", 1)
+                            if key not in old_grads:
                                 continue
                             g = p.grad
-                            g_old = old_grads[name].to(g.device)
+                            g_old = old_grads[key].to(g.device)
+                            num += torch.dot(g.view(-1), g_old.view(-1)).item()
+                            denom_cos += (g.view(-1).norm() * g_old.view(-1).norm()).item() + eps
                             denom = torch.dot(g_old.view(-1), g_old.view(-1)) + eps
                             if denom.item() == 0.0:
                                 continue
                             proj = torch.dot(g.view(-1), g_old.view(-1)) / denom
                             g_ortho = g.view(-1) - cl_ortho_scale * proj * g_old.view(-1)
                             p.grad.copy_(g_ortho.view_as(p))
+                        if denom_cos > 0:
+                            kd_ortho_cos.update(num / denom_cos)
+                        elif not getattr(self, "_kd_ortho_debug_logged", False):
+                            try:
+                                self.run_manager.write_log(
+                                    f"[Ortho] task{self.task_id} kd_ortho grads empty: "
+                                    f"old_grads_len={len(old_grads)}, "
+                                    f"kd_ortho_ref={'yes' if kd_ortho_ref_grads is not None else 'no'}",
+                                    prefix="train",
+                                    should_print=True,
+                                )
+                            except Exception:
+                                pass
+                            self._kd_ortho_debug_logged = True
                     torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
-                    self.run_manager.optimizer.step()  # update weight parameters
-                    # unused modules back
+                    self.run_manager.optimizer.step()
                     self.net.unused_modules_back()
                     
                 # skip architecture parameter updates in the first epoch
                 if epoch > 0:
                     # update architecture parameters according to update_schedule
                     for j in range(update_schedule.get(i, 0)):
-                        start_time = time.time()
+                        # ---- 强化学习更新 ----
                         if isinstance(self.arch_search_config, RLArchSearchConfig):
-                            # [1]. Reinforcement Update
                             self.rl_update_step(fast=True)
 
+                        # ---- 梯度更新 ----
                         elif isinstance(
                             self.arch_search_config, GradientArchSearchConfig
                         ):
-                            # [2]. Gradient Update
                             self.gradient_step()
-                            # [!] Update arch_optimizer
 
                         else:
                             raise ValueError(
@@ -669,13 +837,33 @@ class ArchSearchRunManager:
             writer.add_scalar(tb_prefix + "_train_loss", losses.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top1", top1.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top5", top5.avg, epoch)
+            if cl_ortho_method == "kd_ortho" and kd_ortho_cos.count > 0:
+                writer.add_scalar(tb_prefix + "_kd_ortho_cos", kd_ortho_cos.avg, epoch)
+                # 额外打印到日志，便于在控制台/文件中快速查看
+                try:
+                    self.run_manager.write_log(
+                        f"epoch {epoch} kd_ortho_cos={kd_ortho_cos.avg:.4f}",
+                        prefix="train",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
+            elif cl_ortho_method == "kd_ortho" and kd_ortho_cos.count == 0:
+                try:
+                    self.run_manager.write_log(
+                        f"epoch {epoch} kd_ortho_cos not computed (no valid grads/ref)",
+                        prefix="train",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
             # validate
             if (epoch + 1) % self.run_manager.run_config.validation_frequency == 0:
                 (val_loss, val_top1, val_top5), flops, latency = self.validate()
                 self.local_valid_losses.update(val_loss)
                 self.local_valid_top1.update(
                     val_top1
-                )  # 需要.avg吗？数据结构为什么？top1才要.avg
+                ) 
                 self.run_manager.best_acc = max(self.run_manager.best_acc, val_top1)
                 writer.add_scalar(tb_prefix + "_val_loss", val_loss, epoch)
                 writer.add_scalar(tb_prefix + "_val_top1", val_top1, epoch)
@@ -703,10 +891,20 @@ class ArchSearchRunManager:
         # sample a batch of data from validation set
         images, labels = self.run_manager.run_config.valid_next_batch
         images, labels = images.cuda(non_blocking=True), labels.cuda(non_blocking=True)
+        # replay 参数（若需要旧任务偏好）
+        per_batch = getattr(self.run_manager, "replay_per_batch", 0) or 0
+        use_replay = (
+            getattr(self, "arch_replay_lambda", 0.0) > 0
+            and hasattr(self.run_manager, "replay_buffer")
+            and self.run_manager.replay_buffer is not None
+            and per_batch > 0
+            and len(self.run_manager.replay_buffer) > 0
+        )
         # sample nets and get their validation accuracy, latency, etc
         grad_buffer = []
         reward_buffer = []
         net_info_buffer = []
+        replay_info_logged = False
         for i in range(self.arch_search_config.batch_size):
             self.net.reset_binary_gates()  # random sample binary gates
             self.net.unused_modules_off()  # remove unused module for speedup
@@ -714,7 +912,33 @@ class ArchSearchRunManager:
             with torch.no_grad():
                 output = self.run_manager.net(images)
                 acc1, acc5 = accuracy(output, labels, topk=(1, 5))
+                replay_penalty = 0.0
+                if use_replay:
+                    rep_x, rep_y = self.run_manager.replay_buffer.sample(
+                        per_batch,
+                        mode=getattr(self.run_manager, "replay_mode", "task_balanced"),
+                        replay_old_task_scale=getattr(self.run_manager, "replay_old_task_scale", 1.0),
+                        replay_old_task_scale_by_f=getattr(self.run_manager, "replay_old_task_scale_by_f", 0.0),
+                        task_forgetting=getattr(self.run_manager, "task_forgetting", None),
+                    )
+                    rep_x = rep_x.to(self.run_manager.device)
+                    rep_y = rep_y.to(self.run_manager.device)
+                    rep_out = self.run_manager.net(rep_x)
+                    rep_loss = self.run_manager.criterion(rep_out, rep_y)
+                    replay_penalty = self.arch_replay_lambda * rep_loss.item()
+                    if not replay_info_logged:
+                        try:
+                            self.run_manager.write_log(
+                                f"[ArchReplay-RL] use replay in rl_update_step: per_batch={per_batch}, "
+                                f"lambda={self.arch_replay_lambda}, buffer_size={len(self.run_manager.replay_buffer)}",
+                                prefix="arch",
+                                should_print=True,
+                            )
+                        except Exception:
+                            pass
+                        replay_info_logged = True
             net_info = {"acc": acc1[0].item()}
+            
             # get additional net info for calculating the reward
             if self.arch_search_config.target_hardware is None:
                 pass
@@ -726,9 +950,12 @@ class ArchSearchRunManager:
                         l_type=self.arch_search_config.target_hardware, fast=fast
                     )
                 )
+                
             net_info_buffer.append(net_info)
             # calculate reward according to net_info
             reward = self.arch_search_config.calculate_reward(net_info)
+            if use_replay:
+                reward = reward - replay_penalty
             # loss term
             obj_term = 0
             for m in self.net.redundant_modules:
@@ -795,6 +1022,37 @@ class ArchSearchRunManager:
         time3 = time.time()  # time
         # loss
         ce_loss = self.run_manager.criterion(output, labels)
+        # 可选：混入 replay 批次，对架构参数施加旧任务偏好
+        if (
+            getattr(self, "arch_replay_lambda", 0.0) > 0
+            and hasattr(self.run_manager, "replay_buffer")
+            and self.run_manager.replay_buffer is not None
+        ):
+            per_batch = getattr(self.run_manager, "replay_per_batch", 0) or 0
+            if per_batch > 0 and len(self.run_manager.replay_buffer) > 0:
+                rep_x, rep_y = self.run_manager.replay_buffer.sample(
+                    per_batch,
+                    mode=getattr(self.run_manager, "replay_mode", "task_balanced"),
+                    replay_old_task_scale=getattr(self.run_manager, "replay_old_task_scale", 1.0),
+                    replay_old_task_scale_by_f=getattr(self.run_manager, "replay_old_task_scale_by_f", 0.0),
+                    task_forgetting=getattr(self.run_manager, "task_forgetting", None),
+                )
+                rep_x = rep_x.to(self.run_manager.device)
+                rep_y = rep_y.to(self.run_manager.device)
+                rep_out = self.run_manager.net(rep_x)
+                rep_loss = self.run_manager.criterion(rep_out, rep_y)
+                ce_loss = ce_loss + self.arch_replay_lambda * rep_loss
+                if not self._arch_replay_logged:
+                    try:
+                        self.run_manager.write_log(
+                            f"[ArchReplay] use replay in gradient_step: per_batch={per_batch}, "
+                            f"lambda={self.arch_replay_lambda}, buffer_size={len(self.run_manager.replay_buffer)}",
+                            prefix="arch",
+                            should_print=True,
+                        )
+                    except Exception:
+                        pass
+                    self._arch_replay_logged = True
         if self.arch_search_config.target_hardware is None:
             expected_value = None
         elif self.arch_search_config.target_hardware == "mobile":
@@ -851,80 +1109,61 @@ class ArchSearchRunManager:
         ortho_samples_per_task=0,
         cl_penalty_clip=None,
     ):
+        # ========== Warmup 总览：用当前训练集预训练权重，不更新架构参数 ==========
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
                 self.net.load_state_dict(server_model.module.state_dict())
             else:
                 self.net.load_state_dict(server_model.state_dict())
-        # teacher for warmup KD/REG
-        distill_model = None
-        if teacher_model is not None:
-            distill_model = copy.deepcopy(teacher_model)
-            if isinstance(distill_model, nn.DataParallel):
-                distill_model = distill_model.module
-            distill_model = distill_model.to(self.run_manager.device)
-            distill_model.eval()
-        eff_kd_lambda = cl_kd_lambda if cl_kd_lambda is not None else kd_lambda
-        eff_kd_temperature = cl_kd_temperature if cl_kd_temperature is not None else kd_temperature
-        eff_kd_method = (cl_kd_method or "none").lower()
-        eff_kd_conf = cl_kd_conf_threshold if cl_kd_conf_threshold is not None else 0.5
-        reg_lambda = reg_lambda if reg_lambda > 0 else getattr(self.run_manager.run_config, "ewc_lambda", 0.0)
-        reg_anchor_params, fisher_params = None, None
-        if distill_model is not None and reg_lambda > 0:
-            reg_model = copy.deepcopy(distill_model)
-            if isinstance(reg_model, nn.DataParallel):
-                reg_model = reg_model.module
-            reg_model = reg_model.to(self.run_manager.device)
-            reg_model.eval()
-            reg_anchor_params = {}
-            for name, p in reg_model.named_parameters():
-                if p.requires_grad:
-                    reg_anchor_params[name] = p.detach().clone()
-            if reg_use_ewc:
-                fisher_params = {}
-                sample_loader = list(self.run_manager.run_config.train_loader)
-                if len(sample_loader) > 0:
-                    imgs, labels = sample_loader[0]
-                    imgs, labels = imgs.to(self.run_manager.device), labels.to(self.run_manager.device)
-                    reg_model.zero_grad()
-                    out = reg_model(imgs)
-                    ce = F.cross_entropy(out, labels)
-                    ce.backward()
-                    for name, p in reg_model.named_parameters():
-                        if p.grad is not None and p.requires_grad:
-                            fisher_params[name] = p.grad.detach().pow(2)
-        lr_max = 0.025
+        
+        # 预准备：不做权重锚定/EWC/正则/正交/蒸馏
+        # distill_model = None
+        # if teacher_model is not None:
+        #     distill_model = copy.deepcopy(teacher_model)
+        #     if isinstance(distill_model, nn.DataParallel):
+        #         distill_model = distill_model.module
+        #     distill_model = distill_model.to(self.run_manager.device)
+        #     distill_model.eval()
+            
+        # eff_kd_lambda = cl_kd_lambda if cl_kd_lambda is not None else kd_lambda
+        # eff_kd_temperature = cl_kd_temperature if cl_kd_temperature is not None else kd_temperature
+        # eff_kd_method = (cl_kd_method or "none").lower()
+        # eff_kd_conf = cl_kd_conf_threshold if cl_kd_conf_threshold is not None else 0.5
+        # reg_lambda = reg_lambda if reg_lambda > 0 else getattr(self.run_manager.run_config, "ewc_lambda", 0.0)
+        # reg_anchor_params, fisher_params = None, None
+        # kd_ortho_ref_grads = None
+    
+        # 日志文件：记录每个 batch 被激活的候选算子
+        ops_log_path = os.path.join(
+            self.run_manager.save_path, "logs", "warmup_active_ops.log"
+        )
+        os.makedirs(os.path.dirname(ops_log_path), exist_ok=True)
+        ops_log_f = open(ops_log_path, "a", buffering=1)
+        ops_log_f.write("# warmup active ops log\n")
+
+        # 指标记录
         val_loss, val_top1, val_top5, warmup_lr = None, None, None, None
         losses, top1, top5 = AverageMeter(), AverageMeter(), AverageMeter()
+        
+        # 数据贮备
+        lr_max = 0.025
         data_loader = self.run_manager.run_config.train_loader
         data_loader = list(data_loader)
         nBatch = len(data_loader)
         T_total = warmup_epochs * nBatch
 
-        # 逐epoch进行训练
-        kd_ortho_ref_grads = None
-        if (
-            cl_ortho_method == "kd_ortho"
-            and distill_model is not None
-            and eff_kd_lambda > 0
-            and ortho_samples_per_task > 0
-        ):
-            kd_ortho_ref_grads = self.run_manager.build_kd_ortho_reference(
-                max_samples=ortho_samples_per_task
-            )
+        # ---- 每个 epoch 的权重训练 ----
         for epoch in range(start_local_epoch, last_local_epoch):
             batch_time = AverageMeter()
             data_time = AverageMeter()
             losses, top1, top5 = AverageMeter(), AverageMeter(), AverageMeter()
-            # switch to train mode
             self.run_manager.net.train()
-
             end = time.time()
 
-            # epoch分解出batch中的训练
             for i, (images, labels) in enumerate(data_loader):
                 data_time.update(time.time() - end)
-                # lr动态调整
+                
+                # ---- lr动态调整 ---- 
                 T_cur = epoch * nBatch + i
                 warmup_lr = 0.5 * lr_max * (1 + math.cos(math.pi * T_cur / T_total))
                 for param_group in self.run_manager.optimizer.param_groups:
@@ -932,128 +1171,71 @@ class ArchSearchRunManager:
                 images, labels = images.cuda(non_blocking=True), labels.cuda(
                     non_blocking=True
                 )
-                # compute output
-                self.net.reset_binary_gates()  # random sample binary gates  随机选path  from supernet
-                self.net.unused_modules_off()  # remove unused module for speedup  移除未选的path
-                output = self.run_manager.net(images)  # forward (DataParallel)
+                
+                # ---- 前向：随机采样子网并 forward ---- 
+                self.net.reset_binary_gates()  # 随机选 path
+                self.net.unused_modules_off()  # 移除未选 path 加速
+
+                # 记录本 batch 激活的候选算子，便于后续分析抽样分布
+                if ops_log_f is not None:
+                    active_ops = []
+                    for m in self.net.redundant_modules:
+                        try:
+                            idx = m.active_index[0]
+                            if isinstance(idx, tuple):
+                                idx = idx[0]
+                            op = m.candidate_ops[idx]
+                            active_ops.append(op.module_str)
+                        except Exception as e:
+                            active_ops.append(f"ERR:{type(m).__name__}")
+                    ops_log_f.write(
+                        f"epoch={epoch} batch={i} ops=[{'; '.join(active_ops)}]\n"
+                    )
+
+                output = self.run_manager.net(images)
+                
+                # 检测非有限输出
                 if not torch.isfinite(output).all():
                     print(f"[Warmup] non-finite output detected at epoch {epoch} batch {i}, clamp to finite")
                     output = torch.nan_to_num(output, nan=0.0, posinf=1e4, neginf=-1e4)
-                # loss
+                    
+                # ---- ce损失计算 ---- 
                 if self.run_manager.run_config.label_smoothing > 0:
                     ce_loss = cross_entropy_with_label_smoothing(
                         output, labels, self.run_manager.run_config.label_smoothing
                     )
                 else:
                     ce_loss = self.run_manager.criterion(output, labels)
-                if not torch.isfinite(ce_loss):
-                    print(f"[Warmup] non-finite ce_loss detected at epoch {epoch} batch {i}, skip step")
-                    self.net.unused_modules_back()
-                    continue
-                ewc_penalty = self.run_manager._ewc_penalty()
-                kd_loss = None
-                teacher_output = None
-                if distill_model is not None and eff_kd_lambda > 0 and eff_kd_method in ["logit", "logit_conf"]:
-                    with torch.no_grad():
-                        teacher_output = distill_model(images)
-                        if not torch.isfinite(teacher_output).all():
-                            teacher_output = torch.nan_to_num(teacher_output, nan=0.0, posinf=1e4, neginf=-1e4)
-                    T = eff_kd_temperature if eff_kd_temperature is not None else 1.0
-                    s_logp = F.log_softmax(output / T, dim=1)
-                    t_prob = F.softmax(teacher_output / T, dim=1)
-                    if eff_kd_method == "logit":
-                        kd_loss = F.kl_div(s_logp, t_prob, reduction="batchmean") * (T * T)
-                    else:
-                        mask = (t_prob > eff_kd_conf).float()
-                        if mask.sum() > 0:
-                            log_t = torch.log(t_prob + 1e-12)
-                            kd_loss = ((t_prob * (log_t - s_logp)) * mask).sum() / mask.sum()
-                            kd_loss = kd_loss * (T * T)
-                    if kd_loss is not None and not torch.isfinite(kd_loss):
-                        print(f"[Warmup] non-finite kd_loss at epoch {epoch} batch {i}, drop KD term")
-                        kd_loss = None
-                reg_loss = None
-                if reg_anchor_params is not None and reg_lambda > 0:
-                    reg_loss = 0.0
-                    for name, p in self.run_manager.net.named_parameters():
-                        if not p.requires_grad:
-                            continue
-                        anchor = reg_anchor_params.get(name.replace("module.", "", 1))
-                        if anchor is None or anchor.shape != p.shape:
-                            continue
-                        weight = fisher_params.get(name.replace("module.", "", 1), 1.0) if fisher_params is not None else 1.0
-                        if torch.is_tensor(weight):
-                            weight = weight.mean().item()
-                        reg_loss = reg_loss + weight * (p - anchor).pow(2).sum()
-                    reg_loss_tensor = reg_loss if torch.is_tensor(reg_loss) else torch.tensor(reg_loss, device=self.run_manager.device)
-                    if not torch.isfinite(reg_loss_tensor):
-                        print(f"[Warmup] non-finite reg_loss at epoch {epoch} batch {i}, drop REG term")
-                        reg_loss = None
+                
+                # 检测非有限损失
                 total_loss = ce_loss
-                if kd_loss is not None and eff_kd_lambda > 0:
-                    total_loss = total_loss + eff_kd_lambda * kd_loss
-                if ewc_penalty is not None and torch.isfinite(ewc_penalty):
-                    penalty_term = self.run_manager.ewc_lambda * ewc_penalty
-                    if cl_penalty_clip is not None:
-                        penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
-                    total_loss = total_loss + penalty_term
-                if reg_loss is not None and reg_lambda > 0:
-                    penalty_term = reg_lambda * reg_loss
-                    if cl_penalty_clip is not None:
-                        penalty_term = torch.clamp(penalty_term, max=cl_penalty_clip)
-                    total_loss = total_loss + penalty_term
                 if not torch.isfinite(total_loss):
                     # 本轮总 loss 不可用，跳过但释放关闭的模块
                     print(f"[Warmup] non-finite total_loss at epoch {epoch} batch {i}, skip step")
                     self.net.unused_modules_back()
                     continue
-                old_grads = None
-                if (
-                    cl_ortho_method == "kd_ortho"
-                    and kd_loss is not None
-                    and eff_kd_lambda > 0
-                    and distill_model is not None
-                ):
-                    if kd_ortho_ref_grads is not None:
-                        old_grads = {n: g.to(self.run_manager.device) for n, g in kd_ortho_ref_grads.items()}
-                    else:
-                        self.run_manager.optimizer.zero_grad()
-                        self.run_manager.net.zero_grad()
-                        kd_loss.backward(retain_graph=True)
-                        old_grads = {}
-                        for name, p in self.run_manager.net.named_parameters():
-                            if p.grad is not None and p.requires_grad:
-                                old_grads[name] = p.grad.detach().clone()
-                        self.run_manager.optimizer.zero_grad()
-                        self.run_manager.net.zero_grad()
-                # measure accuracy and record loss
+                
+                # ---- 统计指标 ----
                 acc1, acc5 = accuracy(output, labels, topk=(1, 5))
                 losses.update(total_loss.item(), images.size(0))
                 top1.update(acc1[0].item(), images.size(0))
                 top5.update(acc5[0].item(), images.size(0))
-                # compute gradient and do SGD step
-                self.run_manager.net.zero_grad()  # zero grads of weight_param, arch_param & binary_param
+                
+                # ---- 反向传播 & 权重更新 ----
+                self.run_manager.net.zero_grad()
                 total_loss.backward()
-                if old_grads is not None:
-                    eps = 1e-12
-                    for name, p in self.run_manager.net.named_parameters():
-                        if p.grad is None or name not in old_grads:
-                            continue
-                        g = p.grad
-                        g_old = old_grads[name].to(g.device)
-                        denom = torch.dot(g_old.view(-1), g_old.view(-1)) + eps
-                        if denom.item() == 0.0:
-                            continue
-                        proj = torch.dot(g.view(-1), g_old.view(-1)) / denom
-                        g_ortho = g.view(-1) - cl_ortho_scale * proj * g_old.view(-1)
-                        p.grad.copy_(g_ortho.view_as(p))
                 torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
-                self.run_manager.optimizer.step()  # update weight parameters  更新选中path的权重
-                # unused modules back
+                
+                # 更新选中path的权重
+                self.run_manager.optimizer.step()  
+                # 恢复未选中path
                 self.net.unused_modules_back()
-                # measure elapsed time
+            
+                # 时间统计
                 batch_time.update(time.time() - end)
                 end = time.time()
+                
+            # ---- epoch 结束，记录指标 & 验证 ----
             (val_loss, val_top1, val_top5), flops, latency = self.validate()
             cid = self.run_manager.run_config.data_provider.client_id
             tb_prefix = f"task_{self.task_id}_client_{cid}_"
@@ -1063,6 +1245,8 @@ class ArchSearchRunManager:
             writer.add_scalar(tb_prefix + "_warmup_val_loss", val_loss, epoch)
             writer.add_scalar(tb_prefix + "_warmup_val_top1", val_top1, epoch)
             writer.add_scalar(tb_prefix + "_warmup_val_top5", val_top5, epoch)
+        if ops_log_f is not None:
+            ops_log_f.close()
         return losses.avg, top1.avg, top5.avg, val_loss, val_top1, val_top5, warmup_lr
 
     def ReturnServerModelWeight(self):

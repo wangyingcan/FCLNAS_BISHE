@@ -90,7 +90,9 @@ class ClusteringMachine:
                     cl_ortho_method=cl_ortho_method,
                     cl_ortho_scale=cl_ortho_scale,
                     ortho_samples_per_task=ortho_samples_per_task,
-                    cl_penalty_clip=cl_penalty_clip)
+                    cl_penalty_clip=cl_penalty_clip,
+                    arch_replay_lambda=getattr(self.config, "arch_replay_lambda", 0.0),
+                )
                 # local_weight 表示该客户端本轮可用的训练样本数，聚合时作为加权系数
                 local_weight = self.clients[idx].get_local_data_weight()
                 if local_weight <= 0:
@@ -333,7 +335,7 @@ class ClusteringMachine:
             os.makedirs(logs_path, exist_ok=True)
             self._logs_path = logs_path
         return self._logs_path
-      
+
     def write_log(self, log_str, prefix, should_print=True, end='\n'):
         with open(os.path.join(self.logs_path, '%s.log' % prefix), 'a') as fout:
             fout.write(log_str + end)
@@ -348,8 +350,6 @@ class ClusteringMachine:
             os.makedirs(logs_path, exist_ok=True)
             self._logs_path = logs_path
         return self._logs_path
-
-    
     def get_server(self):
         return copy.deepcopy(self.global_server)
 

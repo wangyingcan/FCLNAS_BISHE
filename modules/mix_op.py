@@ -21,6 +21,11 @@ def build_candidate_ops(candidate_ops, in_channels, out_channels, stride, ops_or
     name2ops = {
         'Identity': lambda in_C, out_C, S: IdentityLayer(in_C, out_C, ops_order=ops_order),
         'Zero': lambda in_C, out_C, S: ZeroLayer(stride=S),
+        
+        # 新增layer
+        'ResNetBlock': lambda in_C, out_C, S: ResNetBlock(in_C, out_C, S),
+        'DenseNetBlock': lambda in_C, out_C, S: DenseNetBlock(in_C, out_C, S, growth_rate=12, num_layers=6),
+        'SEBlock': lambda in_C, out_C, S: SEBlock(in_C, out_C, S),
     }
     # add MBConv layers
     name2ops.update({
@@ -203,7 +208,6 @@ class MixedEdge(MyModule):
         return flops, self.forward(x)
 
     """ """
-
     def binarize(self):
         """ prepare: active_index, inactive_index, AP_path_wb, log_prob (optional), current_prob_over_ops (optional) """
         self.log_prob = None

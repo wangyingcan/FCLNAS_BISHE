@@ -989,30 +989,35 @@ def main():
                 run_mgr.run_config._train_iter = None
                 run_mgr.run_config._valid_iter = None
                 run_mgr.run_config._test_iter = None
-            def _prefill_replay_buffer(run_mgr: RunManager, prefill_task_id: int, min_required: int = 1):
+            def _rebuild_replay_buffer(run_mgr: RunManager, prefill_task_ids: list):
                 buf = getattr(run_mgr, "replay_buffer", None)
                 if (
                     buf is None
                     or getattr(run_mgr, "replay_mode", "none") == "none"
                     or getattr(run_mgr, "replay_capacity", 0) <= 0
+                    or not prefill_task_ids
                 ):
-                    return 0
-                if len(buf) >= min_required:
-                    return 0
-                loader = run_mgr.run_config.train_loader
-                added = 0
-                for images, labels in loader:
-                    buf.add_batch(images.detach().cpu(), labels.detach().cpu(), prefill_task_id)
-                    added += images.size(0)
-                    if buf.capacity > 0 and len(buf) >= buf.capacity:
-                        break
-                run_mgr.run_config._train_iter = None
+                    return {}
+                buf.clear()
+                stats = {}
+                per_task_quota = buf.capacity // len(prefill_task_ids) if buf.capacity > 0 else 0
+                current_task = run_mgr.task_id
+                for task in prefill_task_ids:
+                    _reset_run_manager_task(run_mgr, task)
+                    added = 0
+                    for images, labels in run_mgr.run_config.train_loader:
+                        buf.add_batch(images.detach().cpu(), labels.detach().cpu(), task)
+                        added += images.size(0)
+                        if per_task_quota > 0 and added >= per_task_quota:
+                            break
+                    stats[task] = added
+                _reset_run_manager_task(run_mgr, current_task)
                 hist = buf.task_hist() if hasattr(buf, "task_hist") else {}
                 print(
-                    f"[ReplayPrefill] task{prefill_task_id} -> added={added}, "
-                    f"buffer_size={len(buf)}, hist={hist}"
+                    f"[ReplayPrefill] tasks={prefill_task_ids} quota={per_task_quota} "
+                    f"buffer_size={len(buf)} hist={hist}"
                 )
-                return added
+                return stats
 
             retrain_task_schedule = list(range(1, task_id + 1)) if args.retrain_sequence_from_task1 else [task_id]
             # 后续 task 的多轮重训不再清理 log，避免覆盖上一任务的记录
@@ -1049,18 +1054,10 @@ def main():
             # retrain_sequence_from_task1 关闭时，先遍历前序任务，为 replay buffer 注入旧样本
             if not args.retrain_sequence_from_task1 and task_id > 1:
                 print(f"[ReplayPrefill] retrain_sequence_from_task1=OFF，预先填充任务 1~{task_id - 1} 的样本到 replay buffer")
-                for prefill_task_id in range(1, task_id):
-                    _reset_run_manager_task(global_run_manager, prefill_task_id)
-                    added_global = _prefill_replay_buffer(global_run_manager, prefill_task_id)
-                    added_clients = []
-                    for client_rm in clients:
-                        _reset_run_manager_task(client_rm, prefill_task_id)
-                        added_clients.append(_prefill_replay_buffer(client_rm, prefill_task_id))
-                    print(
-                        f"[ReplayPrefill] task{prefill_task_id} -> global_added={added_global}, "
-                        f"clients_added={[int(x) for x in added_clients]}"
-                    )
-                # 预填充完成后恢复当前 task_id
+                tasks_to_fill = list(range(1, task_id))
+                _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
+                for client_rm in clients:
+                    _rebuild_replay_buffer(client_rm, tasks_to_fill)
                 _reset_run_manager_task(global_run_manager, task_id)
                 for client_rm in clients:
                     _reset_run_manager_task(client_rm, task_id)
@@ -1076,23 +1073,14 @@ def main():
                 if args.retrain_sequence_from_task1:
                     global_run_manager.reset_forgetting_stats()
                 if args.retrain_sequence_from_task1 and retrain_task_id < task_id:
-                    added_global = _prefill_replay_buffer(
-                        global_run_manager, retrain_task_id, min_required=global_run_manager.replay_per_batch
-                    )
-                    added_clients = []
-                    for client_rm in clients:
+                    tasks_to_fill = list(range(1, retrain_task_id + 1))
+                    global_stats = _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
+                    for idx, client_rm in enumerate(clients):
+                        client_stats = _rebuild_replay_buffer(client_rm, tasks_to_fill)
                         _reset_run_manager_task(client_rm, retrain_task_id)
                         if args.retrain_sequence_from_task1:
                             client_rm.reset_forgetting_stats()
-                        added_clients.append(
-                            _prefill_replay_buffer(
-                                client_rm, retrain_task_id, min_required=client_rm.replay_per_batch
-                            )
-                        )
-                    print(
-                        f"[ReplayPrefill] task{retrain_task_id} -> global_added={added_global}, "
-                        f"clients_added={[int(x) for x in added_clients]}"
-                    )
+                        print(f"[ReplayPrefill] client{idx} stats={client_stats}")
                 else:
                     for client_rm in clients:
                         _reset_run_manager_task(client_rm, retrain_task_id)

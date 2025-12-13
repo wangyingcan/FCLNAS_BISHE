@@ -45,6 +45,10 @@ class SimpleReplayBuffer:
         # 随机删除直至容量限制
         self._rebalance_to_capacity()
 
+    def clear(self):
+        self.storage = []
+        self._time = 0
+
     def sample(self, k: int, mode: str = "global", exclude_task: int = None,
                current_task: int = None, old_task_scale: float = 1.0,
                forgetting_map: dict = None, old_task_scale_by_f: float = 0.0):

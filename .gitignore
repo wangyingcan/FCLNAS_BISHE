@@ -1,4 +1,5 @@
 
 *.out
-output_test2
-output_test3
+output_test*
+env_dir
+run

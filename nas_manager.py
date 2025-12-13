@@ -217,11 +217,12 @@ class ArchSearchRunManager:
         warmup=False,
         task_id=1,
         init_model=True,
+        replay_buffer=None,
     ):
         # init weight parameters & build weight_optimizer
         # Super_net is put in RunManager.
         self.run_manager = RunManager(
-            path, super_net, run_config, True, task_id, None, init_model
+            path, super_net, run_config, True, task_id, None, init_model, replay_buffer=replay_buffer
         )  # idxs=user_groups[idx]
         self.task_id = task_id
         # use GPU to train net
@@ -652,6 +653,7 @@ class ArchSearchRunManager:
         self.arch_replay_lambda = arch_replay_lambda
         # 避免重复打印
         self._arch_replay_logged = False
+        self._arch_replay_skip_logged = False
         self._reg_warned = False
         self._reg_debug_logged = False
         self._teacher_warned = False
@@ -914,8 +916,11 @@ class ArchSearchRunManager:
                 acc1, acc5 = accuracy(output, labels, topk=(1, 5))
                 replay_penalty = 0.0
                 if use_replay:
+                    per_batch_eff = per_batch
+                    if per_batch_eff <= 0 and len(self.run_manager.replay_buffer) > 0:
+                        per_batch_eff = min(len(self.run_manager.replay_buffer), 32)
                     rep_x, rep_y = self.run_manager.replay_buffer.sample(
-                        per_batch,
+                        per_batch_eff,
                         mode=getattr(self.run_manager, "replay_mode", "task_balanced"),
                         replay_old_task_scale=getattr(self.run_manager, "replay_old_task_scale", 1.0),
                         replay_old_task_scale_by_f=getattr(self.run_manager, "replay_old_task_scale_by_f", 0.0),
@@ -929,7 +934,7 @@ class ArchSearchRunManager:
                     if not replay_info_logged:
                         try:
                             self.run_manager.write_log(
-                                f"[ArchReplay-RL] use replay in rl_update_step: per_batch={per_batch}, "
+                                f"[ArchReplay-RL] use replay in rl_update_step: per_batch={per_batch_eff}, "
                                 f"lambda={self.arch_replay_lambda}, buffer_size={len(self.run_manager.replay_buffer)}",
                                 prefix="arch",
                                 should_print=True,
@@ -937,6 +942,26 @@ class ArchSearchRunManager:
                         except Exception:
                             pass
                         replay_info_logged = True
+                elif per_batch > 0 and len(self.run_manager.replay_buffer) == 0 and not replay_info_logged:
+                    try:
+                        self.run_manager.write_log(
+                            f"[ArchReplay-RL] skip: buffer empty (per_batch={per_batch}, lambda={self.arch_replay_lambda})",
+                            prefix="arch",
+                            should_print=True,
+                        )
+                    except Exception:
+                        pass
+                    replay_info_logged = True
+                elif per_batch == 0 and not replay_info_logged:
+                    try:
+                        self.run_manager.write_log(
+                            f"[ArchReplay-RL] skip: per_batch=0 (lambda={self.arch_replay_lambda})",
+                            prefix="arch",
+                            should_print=True,
+                        )
+                    except Exception:
+                        pass
+                    replay_info_logged = True
             net_info = {"acc": acc1[0].item()}
             
             # get additional net info for calculating the reward
@@ -1028,7 +1053,12 @@ class ArchSearchRunManager:
             and hasattr(self.run_manager, "replay_buffer")
             and self.run_manager.replay_buffer is not None
         ):
-            per_batch = getattr(self.run_manager, "replay_per_batch", 0) or 0
+            per_batch = getattr(self.run_manager, "replay_per_batch", 0) or getattr(
+                self.run_manager.run_config, "replay_per_batch", 0
+            ) or 0
+            # 若未配置但 buffer 有数据，尝试用默认值兜底
+            if per_batch <= 0 and len(self.run_manager.replay_buffer) > 0:
+                per_batch = min(len(self.run_manager.replay_buffer), 32)
             if per_batch > 0 and len(self.run_manager.replay_buffer) > 0:
                 rep_x, rep_y = self.run_manager.replay_buffer.sample(
                     per_batch,
@@ -1053,6 +1083,26 @@ class ArchSearchRunManager:
                     except Exception:
                         pass
                     self._arch_replay_logged = True
+            elif per_batch > 0 and len(self.run_manager.replay_buffer) == 0 and not self._arch_replay_skip_logged:
+                try:
+                    self.run_manager.write_log(
+                        f"[ArchReplay] skip: buffer empty (per_batch={per_batch}, lambda={self.arch_replay_lambda})",
+                        prefix="arch",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
+                self._arch_replay_skip_logged = True
+            elif per_batch == 0 and not self._arch_replay_skip_logged:
+                try:
+                    self.run_manager.write_log(
+                        f"[ArchReplay] skip: per_batch=0 (lambda={self.arch_replay_lambda})",
+                        prefix="arch",
+                        should_print=True,
+                    )
+                except Exception:
+                    pass
+                self._arch_replay_skip_logged = True
         if self.arch_search_config.target_hardware is None:
             expected_value = None
         elif self.arch_search_config.target_hardware == "mobile":

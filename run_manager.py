@@ -11,6 +11,7 @@ import json
 from datetime import timedelta
 import numpy as np
 import copy
+import math
 
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
@@ -401,6 +402,8 @@ class RunManager:
         self.last_task_acc = None
         # 历史最佳分任务精度，便于计算遗忘 F
         self.best_task_acc = {}
+        # 当前用于经验回放的遗忘表
+        self.task_forgetting = {}
         # 用于 EWC 正则的快照与 Fisher 信息
         self.ewc_prev_params = None
         self.ewc_fisher = None
@@ -475,6 +478,8 @@ class RunManager:
             self.replay_buffer = replay_buffer
         else:
             self.replay_buffer = SimpleReplayBuffer(self.replay_capacity)
+        self.replay_only_training = False
+        self._buffer_train_batch_count = None
 
     def load_ewc_state(self, state):
         """加载外部保存的 EWC 状态；state=None 时重置。"""
@@ -1210,6 +1215,8 @@ class RunManager:
             log_file = "test_console.txt"
         elif prefix == "train":
             log_file = "train_console.txt"
+        elif prefix == "arch":
+            log_file = "arch_console.txt"
         if log_file is not None:
             with open(os.path.join(self.logs_path, log_file), "a") as fout:
                 fout.write(log_str + "\n")
@@ -1318,6 +1325,33 @@ class RunManager:
         else:
             return losses.avg, top1.avg
 
+    def reset_forgetting_stats(self):
+        """清空遗忘统计，使后续任务重新累计偏置。"""
+        self.best_task_acc = {}
+        self.last_task_acc = None
+        self.task_forgetting = {}
+
+    def _buffer_train_iterator(self, expected_batches: int = None):
+        """仅使用 replay buffer 生成训练批次。"""
+        if self.replay_buffer is None or len(self.replay_buffer) == 0:
+            return
+        batch_size = max(1, int(getattr(self.run_config, "train_batch_size", 32)))
+        steps = expected_batches if expected_batches is not None else max(
+            1, math.ceil(len(self.replay_buffer) / batch_size)
+        )
+        for _ in range(steps):
+            rep_x, rep_y = self.replay_buffer.sample(
+                batch_size,
+                mode=self.replay_mode,
+                current_task=self.task_id,
+                old_task_scale=self.replay_old_task_scale,
+                forgetting_map=getattr(self, "task_forgetting", None),
+                old_task_scale_by_f=self.replay_old_task_scale_by_f,
+            )
+            if rep_x is None or rep_y is None:
+                break
+            yield rep_x.to(self.device, non_blocking=True), rep_y.to(self.device, non_blocking=True)
+
     def train_run_manager_one_epoch(self, adjust_lr_func, prev_params_snapshot=None):
         batch_time = AverageMeter()
         data_time = AverageMeter()
@@ -1368,7 +1402,12 @@ class RunManager:
         end = time.time()
         ewc_meter = AverageMeter()
 
-        for i, (images, labels) in enumerate(self.run_config.train_loader):
+        if getattr(self, "replay_only_training", False):
+            data_iterable = self._buffer_train_iterator(self._buffer_train_batch_count)
+        else:
+            data_iterable = self.run_config.train_loader
+
+        for i, (images, labels) in enumerate(data_iterable):
             data_time.update(time.time() - end)
             new_lr = adjust_lr_func(i)
             images, labels = images.to(self.device, non_blocking=True), labels.to(
@@ -1381,6 +1420,7 @@ class RunManager:
                 self.replay_mode != "none"
                 and self.replay_per_batch > 0
                 and len(self.replay_buffer) > 0
+                and not getattr(self, "replay_only_training", False)
             ):
                 rep_x, rep_y = self.replay_buffer.sample(
                     self.replay_per_batch,
@@ -1828,6 +1868,22 @@ class RunManager:
                 self.net.module.load_state_dict(server_model.state_dict())
 
         nBatch = len(self.run_config.train_loader)
+        if getattr(self, "replay_only_training", False):
+            buffer_len = len(self.replay_buffer) if self.replay_buffer is not None else 0
+            if buffer_len <= 0:
+                self.write_log(
+                    f"[ReplayOnly] task{self.task_id} buffer empty，跳过本地训练",
+                    prefix="train",
+                    should_print=True,
+                )
+                self._buffer_train_batch_count = 0
+                zero_tuple = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                return zero_tuple
+            batch_sz = max(1, int(getattr(self.run_config, "train_batch_size", 32)))
+            nBatch = max(1, math.ceil(buffer_len / batch_sz))
+            self._buffer_train_batch_count = nBatch
+        else:
+            self._buffer_train_batch_count = None
 
         start_epoch = start_local_epoch
         n_epochs = last_local_epoch

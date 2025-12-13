@@ -210,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_round", default=0, type=int, help="start round in fed_search")
     parser.add_argument("--last_round", default=10, type=int, help="last round in fed_search. 125 for all clients. 175 for cpu/gpu.")  # 讨论硬件差异时就多训练些联邦轮次
     parser.add_argument("--retrain_start_round", type=int, default=0, help="重训阶段起始轮次，默认沿用 start_round")
-    parser.add_argument("--retrain_last_round", type=int, default=20, help="重训阶段最后轮次，默认沿用 last_round")
+    parser.add_argument("--retrain_last_round", type=int, default=5, help="重训阶段最后轮次，默认沿用 last_round")
     parser.add_argument("--retrain_sequence_from_task1", action="store_true",
                         help="重训阶段依次从 task1 训练到当前任务，每个任务各跑 retrain_last_round 轮")
     
@@ -221,8 +221,8 @@ def parse_args() -> argparse.Namespace:
                         help="计算 Fisher 时使用的样本上限，设为 0 可跳过 Fisher 估计")
     parser.add_argument("--ewc_online_interval", type=int, default=0,
                         help="每隔多少 retrain round 在线累积一次 Fisher（0 表示仅在任务结束后计算）")
-    parser.add_argument("--cl_reg_method", type=str, default="mas",
-                        choices=["ewc", "mas", "rwalk"],
+    parser.add_argument("--cl_reg_method", type=str, default="none",
+                        choices=["ewc", "mas", "rwalk","none"],
                         help="持续学习正则方法：ewc / MAS / RWalk（默认 mas）")
     parser.add_argument("--cl_reg_decay", type=float, default=1.0,
                         help="重要性衰减系数，<1 表示按比例保留历史重要性后再累加新重要性")
@@ -424,7 +424,7 @@ def parse_args() -> argparse.Namespace:
     args.n_epochs = args.local_epoch_number * (args.last_round - args.start_round)
 
     # 构建保存目录名（原文件两次赋值，合并为等价流程，行为不变）
-    base_path = "./output_test3/fednas-" + args.arch_algo + str(args.manual_seed)
+    base_path = "./output_test1/fednas-" + args.arch_algo + str(args.manual_seed)
     if args.target_hardware is not None:
         base_path += args.target_hardware
     args.path = base_path + str(args.n_cell_stages)
@@ -583,7 +583,7 @@ def main():
         # ]
         
         args.conv_candidates = [
-            'ResNetBlock','DenseNetBlock','SEBlock',
+            # 'ResNetBlock','DenseNetBlock','SEBlock',
             '3x3_MBConv1', '3x3_MBConv2', '3x3_MBConv3', '3x3_MBConv4', '3x3_MBConv5', '3x3_MBConv6',
             '5x5_MBConv1', '5x5_MBConv2', '5x5_MBConv3', '5x5_MBConv4', '5x5_MBConv5', '5x5_MBConv6',
             '7x7_MBConv1', '7x7_MBConv2', '7x7_MBConv3', '7x7_MBConv4', '7x7_MBConv5', '7x7_MBConv6'
@@ -654,8 +654,9 @@ def main():
         arch_search_config_global_server = copy.deepcopy(arch_search_config)
         global_server = ArchSearchRunManager(
             args.path, super_net, run_config_global_server,
-            arch_search_config_global_server, warmup=args.warmup,task_id = args.task_id,
-            init_model=not loaded_prev_supernet
+            arch_search_config_global_server, warmup=args.warmup, task_id=args.task_id,
+            init_model=not loaded_prev_supernet,
+            replay_buffer=replay_buffers_across_tasks[0] if replay_buffers_across_tasks else None,
         )
         # 继承上一任务的全局优化器状态（在 global_server 创建后再尝试）
         if task_id > 1:
@@ -709,9 +710,12 @@ def main():
             )
             # 使用上一任务的初始化
             local_client_super_net.load_state_dict(base_supernet_state, strict=False)
-            client = ArchSearchRunManager(args.path, local_client_super_net,
-                                          clients_run_config_arr[idx], asc_local,task_id = args.task_id,
-                                          init_model=not loaded_prev_supernet)
+            client = ArchSearchRunManager(
+                args.path, local_client_super_net,
+                clients_run_config_arr[idx], asc_local, task_id=args.task_id,
+                init_model=not loaded_prev_supernet,
+                replay_buffer=replay_buffers_across_tasks[idx] if replay_buffers_across_tasks else None,
+            )
             _attach_replay_cfg(client.run_manager.run_config, args)
             clients.append(client)
 
@@ -985,6 +989,30 @@ def main():
                 run_mgr.run_config._train_iter = None
                 run_mgr.run_config._valid_iter = None
                 run_mgr.run_config._test_iter = None
+            def _prefill_replay_buffer(run_mgr: RunManager, prefill_task_id: int, min_required: int = 1):
+                buf = getattr(run_mgr, "replay_buffer", None)
+                if (
+                    buf is None
+                    or getattr(run_mgr, "replay_mode", "none") == "none"
+                    or getattr(run_mgr, "replay_capacity", 0) <= 0
+                ):
+                    return 0
+                if len(buf) >= min_required:
+                    return 0
+                loader = run_mgr.run_config.train_loader
+                added = 0
+                for images, labels in loader:
+                    buf.add_batch(images.detach().cpu(), labels.detach().cpu(), prefill_task_id)
+                    added += images.size(0)
+                    if buf.capacity > 0 and len(buf) >= buf.capacity:
+                        break
+                run_mgr.run_config._train_iter = None
+                hist = buf.task_hist() if hasattr(buf, "task_hist") else {}
+                print(
+                    f"[ReplayPrefill] task{prefill_task_id} -> added={added}, "
+                    f"buffer_size={len(buf)}, hist={hist}"
+                )
+                return added
 
             retrain_task_schedule = list(range(1, task_id + 1)) if args.retrain_sequence_from_task1 else [task_id]
             # 后续 task 的多轮重训不再清理 log，避免覆盖上一任务的记录
@@ -1018,14 +1046,61 @@ def main():
             _broadcast_ortho_state(ortho_state)
             if teacher_model is not None:
                 _set_teacher_all(teacher_model)
+            # retrain_sequence_from_task1 关闭时，先遍历前序任务，为 replay buffer 注入旧样本
+            if not args.retrain_sequence_from_task1 and task_id > 1:
+                print(f"[ReplayPrefill] retrain_sequence_from_task1=OFF，预先填充任务 1~{task_id - 1} 的样本到 replay buffer")
+                for prefill_task_id in range(1, task_id):
+                    _reset_run_manager_task(global_run_manager, prefill_task_id)
+                    added_global = _prefill_replay_buffer(global_run_manager, prefill_task_id)
+                    added_clients = []
+                    for client_rm in clients:
+                        _reset_run_manager_task(client_rm, prefill_task_id)
+                        added_clients.append(_prefill_replay_buffer(client_rm, prefill_task_id))
+                    print(
+                        f"[ReplayPrefill] task{prefill_task_id} -> global_added={added_global}, "
+                        f"clients_added={[int(x) for x in added_clients]}"
+                    )
+                # 预填充完成后恢复当前 task_id
+                _reset_run_manager_task(global_run_manager, task_id)
+                for client_rm in clients:
+                    _reset_run_manager_task(client_rm, task_id)
 
             for stage_idx, retrain_task_id in enumerate(retrain_task_schedule):
                 print(f"[Retrain] 开始顺序重训 task {retrain_task_id}/{task_id}")
                 if stage_idx > 0:
                     args.skip_retrain_log_cleanup = True
+                replay_only_stage = (
+                    args.retrain_sequence_from_task1 and retrain_task_id < task_id
+                )
                 _reset_run_manager_task(global_run_manager, retrain_task_id)
+                if args.retrain_sequence_from_task1:
+                    global_run_manager.reset_forgetting_stats()
+                if args.retrain_sequence_from_task1 and retrain_task_id < task_id:
+                    added_global = _prefill_replay_buffer(
+                        global_run_manager, retrain_task_id, min_required=global_run_manager.replay_per_batch
+                    )
+                    added_clients = []
+                    for client_rm in clients:
+                        _reset_run_manager_task(client_rm, retrain_task_id)
+                        if args.retrain_sequence_from_task1:
+                            client_rm.reset_forgetting_stats()
+                        added_clients.append(
+                            _prefill_replay_buffer(
+                                client_rm, retrain_task_id, min_required=client_rm.replay_per_batch
+                            )
+                        )
+                    print(
+                        f"[ReplayPrefill] task{retrain_task_id} -> global_added={added_global}, "
+                        f"clients_added={[int(x) for x in added_clients]}"
+                    )
+                else:
+                    for client_rm in clients:
+                        _reset_run_manager_task(client_rm, retrain_task_id)
+                        if args.retrain_sequence_from_task1:
+                            client_rm.reset_forgetting_stats()
+                global_run_manager.replay_only_training = replay_only_stage
                 for client_rm in clients:
-                    _reset_run_manager_task(client_rm, retrain_task_id)
+                    client_rm.replay_only_training = replay_only_stage
                 # 在当前任务开始前同步上一任务的 EWC 状态
                 _broadcast_ewc_state(ewc_state)
                 _broadcast_ortho_state(ortho_state)
@@ -1070,6 +1145,9 @@ def main():
                         ortho_state = global_run_manager.export_ortho_state()
                         _save_state_safely(ortho_state, ortho_state_path, desc="Retrain")
                 print(f"[Retrain] task {retrain_task_id} 重训完成")
+                global_run_manager.replay_only_training = False
+                for client_rm in clients:
+                    client_rm.replay_only_training = False
 
             print('所有客户端重训完成')
             # 记录当前任务后每个客户端的 replay buffer，供下一任务复用

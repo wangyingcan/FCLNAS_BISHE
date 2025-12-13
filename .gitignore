@@ -1,5 +1,4 @@
 
 *.out
-output_test*
 env_dir
 run

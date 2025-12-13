@@ -1,0 +1,10 @@
+search clients_trn_loss 24.9588, clients_trn_top1 18.9778, clients_val_loss 3.2752, clients_val_top1 9.8000, clients_entropy 2.5823, clients_lr 0.0004
+search clients_trn_loss 23.3581, clients_trn_top1 15.7111, clients_val_loss 2.5526, clients_val_top1 12.4000, clients_entropy 2.5478, clients_lr 0.0008
+search clients_trn_loss 23.1246, clients_trn_top1 15.0222, clients_val_loss 2.5674, clients_val_top1 13.0000, clients_entropy 2.5038, clients_lr 0.0012
+search clients_trn_loss 23.2741, clients_trn_top1 13.7556, clients_val_loss 2.6117, clients_val_top1 10.6000, clients_entropy 2.4525, clients_lr 0.0016
+search clients_trn_loss 24.5511, clients_trn_top1 13.8000, clients_val_loss 2.6973, clients_val_top1 13.2000, clients_entropy 2.4194, clients_lr 0.0020
+search clients_trn_loss 26.3987, clients_trn_top1 13.9333, clients_val_loss 2.8253, clients_val_top1 11.8000, clients_entropy 2.4011, clients_lr 0.0007
+search clients_trn_loss 28.4196, clients_trn_top1 13.0444, clients_val_loss 2.9048, clients_val_top1 11.6000, clients_entropy 2.3548, clients_lr 0.0004
+search clients_trn_loss 30.2995, clients_trn_top1 13.0444, clients_val_loss 2.8280, clients_val_top1 11.0000, clients_entropy 2.3130, clients_lr 0.0002
+search clients_trn_loss 32.6630, clients_trn_top1 12.9556, clients_val_loss 2.8338, clients_val_top1 11.0000, clients_entropy 2.2635, clients_lr 0.0000
+search clients_trn_loss 34.4898, clients_trn_top1 12.1111, clients_val_loss 2.9208, clients_val_top1 12.2000, clients_entropy 2.2371, clients_lr 0.0000

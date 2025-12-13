@@ -1,3 +1,0 @@
-[2025-12-10 10:29:46] learned_net,test_eval loss 2.6984, top1 31.6833, top5 65.3000
-[2025-12-10 10:33:01] learned_net,test_eval loss 2.7803, top1 26.8500, top5 64.8000
-[2025-12-10 10:36:10] learned_net,test_eval loss 2.9114, top1 22.4333, top5 63.1333

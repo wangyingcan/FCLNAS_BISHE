@@ -534,6 +534,9 @@ def main():
         args.task_id = task_id  # 设置当前任务的 task_id
         args.search = True
 
+        # 每个任务开始时先恢复 search 阶段的参数配置，避免沿用上轮重训的覆盖值
+        _apply_phase_overrides("search")
+
         args.path = base_task_path + f"-task{task_id}"  # 每个任务使用不同的保存路径
         os.makedirs(args.path, exist_ok=True)
         # 记录命令行，便于复现实验
@@ -556,7 +559,9 @@ def main():
         clients_run_config_arr = []
         for idx in range(args.num_users):
             args.client_id = idx
-            clients_run_config_arr.append(CifarRunConfig(**args.__dict__ , is_client = True))
+            run_cfg = CifarRunConfig(**args.__dict__ , is_client = True)
+            _attach_replay_cfg(run_cfg, args)
+            clients_run_config_arr.append(run_cfg)
 
         # 解析网络结构相关字符串参数
         def _ensure_int_list(x):
@@ -749,8 +754,6 @@ def main():
             cm.test_inference()
 
         if args.object_to_search == "supernet":
-            # search 阶段可选覆盖
-            _apply_phase_overrides("search")
             # teacher：上一任务固化子网，用于 supernet KD / kd_ortho
             super_teacher_model = None
             # 启用 KD / 正交 / 权重锚定(EWC) 任一项，都需要上一任务 teacher

@@ -79,7 +79,8 @@ class CommonwealthMachine:
                     start_local_epoch=start_local_epoch,
                     last_local_epoch=last_local_epoch,
                     server_model=server_model,
-                    writer=self.writerTf)
+                    writer=self.writerTf,
+                    global_round_idx=round + 1)
                 clients_params_arr.append(copy.deepcopy(self.clients[idx].return_model_dict()))
                 clients_data_w.append(self.clients[idx].get_local_data_weight())
                 clients_trn_loss.update(trn_loss)

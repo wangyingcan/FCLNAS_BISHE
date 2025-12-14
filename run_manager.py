@@ -408,6 +408,8 @@ class RunManager:
         self.best_task_acc = {}
         # 当前用于经验回放的遗忘表
         self.task_forgetting = {}
+        # 缓存标签到任务的映射，便于日志统计
+        self._class_to_task_cache = None
         # 用于 EWC 正则的快照与 Fisher 信息
         self.ewc_prev_params = None
         self.ewc_fisher = None
@@ -1336,6 +1338,40 @@ class RunManager:
         self.best_task_acc = {}
         self.last_task_acc = None
         self.task_forgetting = {}
+        self._class_to_task_cache = None
+
+    def _get_class_to_task_map(self):
+        """返回 label->task 的映射，便于统计不同任务的样本量。"""
+        if self._class_to_task_cache is not None:
+            return self._class_to_task_cache or None
+        fm = getattr(self.run_config.data_provider, "fcl_manager", None)
+        mapping = {}
+        if fm is not None and hasattr(fm, "_task_classes"):
+            for t, cls_list in fm._task_classes.items():
+                for c in cls_list:
+                    try:
+                        mapping[int(c)] = int(t)
+                    except Exception:
+                        continue
+        self._class_to_task_cache = mapping
+        return mapping or None
+
+    def _accumulate_label_hist(self, labels_cpu: torch.Tensor, hist_dict: dict):
+        """根据标签更新任务直方图，用于日志分析。"""
+        if hist_dict is None or labels_cpu is None:
+            return
+        mapping = self._get_class_to_task_map()
+        if not mapping:
+            return
+        try:
+            values = labels_cpu.view(-1).tolist()
+        except Exception:
+            return
+        for label in values:
+            task = mapping.get(int(label))
+            if task is None:
+                continue
+            hist_dict[task] = hist_dict.get(task, 0) + 1
 
     def _buffer_train_iterator(self, expected_batches: int = None):
         """仅使用 replay buffer 生成训练批次。"""
@@ -1359,7 +1395,7 @@ class RunManager:
                 break
             yield rep_x.to(self.device, non_blocking=True), rep_y.to(self.device, non_blocking=True)
 
-    def train_run_manager_one_epoch(self, adjust_lr_func, prev_params_snapshot=None):
+    def train_run_manager_one_epoch(self, adjust_lr_func, prev_params_snapshot=None, round_data_meter=None):
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
@@ -1423,6 +1459,27 @@ class RunManager:
             
             # 经验回放：先记录当前 batch，稍后加入 buffer；如有重放样本则拼接
             cur_x_cpu, cur_y_cpu = images.detach().cpu(), labels.detach().cpu()
+            if round_data_meter is not None:
+                primary_count = cur_x_cpu.size(0)
+                round_data_meter["total_batches"] = round_data_meter.get("total_batches", 0) + 1
+                if getattr(self, "replay_only_training", False):
+                    round_data_meter["buffer_primary_batches"] = round_data_meter.get(
+                        "buffer_primary_batches", 0
+                    ) + 1
+                    if getattr(self, "stage_training_buffer", None) is not None:
+                        round_data_meter["samples_from_stage"] = round_data_meter.get(
+                            "samples_from_stage", 0
+                        ) + primary_count
+                    else:
+                        round_data_meter["samples_from_replay"] = round_data_meter.get(
+                            "samples_from_replay", 0
+                        ) + primary_count
+                    self._accumulate_label_hist(cur_y_cpu, round_data_meter.get("primary_task_hist"))
+                else:
+                    round_data_meter["samples_from_task"] = round_data_meter.get(
+                        "samples_from_task", 0
+                    ) + primary_count
+                    self._accumulate_label_hist(cur_y_cpu, round_data_meter.get("primary_task_hist"))
             mix_allowed = (
                 self.replay_mode != "none"
                 and self.replay_per_batch > 0
@@ -1443,8 +1500,18 @@ class RunManager:
                     old_task_scale_by_f=self.replay_old_task_scale_by_f,
                 )
                 if rep_x is not None and rep_y is not None and rep_x.numel() > 0:
+                    rep_count = rep_x.size(0)
+                    rep_y_cpu = rep_y
+                    if round_data_meter is not None and rep_count > 0:
+                        round_data_meter["samples_from_replay"] = round_data_meter.get(
+                            "samples_from_replay", 0
+                        ) + rep_count
+                        round_data_meter["mixed_batches"] = round_data_meter.get(
+                            "mixed_batches", 0
+                        ) + 1
+                        self._accumulate_label_hist(rep_y_cpu, round_data_meter.get("replay_task_hist"))
                     rep_x = rep_x.to(self.device, non_blocking=True)
-                    rep_y = rep_y.to(self.device, non_blocking=True)
+                    rep_y = rep_y_cpu.to(self.device, non_blocking=True)
                     images = torch.cat([images, rep_x], dim=0)
                     labels = torch.cat([labels, rep_y], dim=0)
             
@@ -1871,6 +1938,7 @@ class RunManager:
         print_top5=False,
         server_model=None,
         writer=None,
+        global_round_idx=None,
     ):
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
@@ -1905,6 +1973,30 @@ class RunManager:
             AverageMeter(),
             AverageMeter(),
         )
+        provider = getattr(self.run_config, "data_provider", None)
+        if provider is None:
+            provider = self.run_config.data_provider
+        client_identifier = getattr(provider, "client_id", getattr(self.run_config, "client_id", -1))
+        try:
+            client_identifier = int(client_identifier)
+        except Exception:
+            pass
+        round_data_stats = {
+            "round": int(global_round_idx) if global_round_idx is not None else None,
+            "task_id": int(self.task_id),
+            "client_id": client_identifier,
+            "replay_only": bool(getattr(self, "replay_only_training", False)),
+            "use_stage_buffer": bool(getattr(self, "stage_training_buffer", None) is not None),
+            "samples_from_task": 0,
+            "samples_from_stage": 0,
+            "samples_from_replay": 0,
+            "mixed_batches": 0,
+            "total_batches": 0,
+            "buffer_primary_batches": 0,
+            "epochs": 0,
+            "primary_task_hist": {},
+            "replay_task_hist": {},
+        }
         # 记录本轮开始前的回放缓存分布，便于观测旧任务样本是否被保留
         if self.replay_mode != "none" and self.replay_capacity > 0:
             hist_start = self.replay_buffer.task_hist()
@@ -1929,6 +2021,7 @@ class RunManager:
                     self.optimizer, epoch, i, nBatch
                 ),
                 prev_params_snapshot=prev_params_snapshot,
+                round_data_meter=round_data_stats,
             )
             train_acc_top1_arr.update(train_acc_top1.avg)
             train_acc_top5_arr.update(train_acc_top5.avg)
@@ -1948,6 +2041,7 @@ class RunManager:
                 writer.add_scalar(tb_prefix + "_val_loss", val_loss, epoch)
                 writer.add_scalar(tb_prefix + "_val_top1", val_acc, epoch)
                 writer.add_scalar(tb_prefix + "_val_top5", val_acc5, epoch)
+        round_data_stats["epochs"] = max(0, int((n_epochs or 0) - (start_epoch or 0)))
         # 记录本轮结束后的回放缓存分布
         if self.replay_mode != "none" and self.replay_capacity > 0:
             hist_end = self.replay_buffer.task_hist()
@@ -1957,6 +2051,36 @@ class RunManager:
                 prefix="train",
                 should_print=True,
             )
+        if round_data_stats is not None:
+            round_desc = round_data_stats.get("round")
+            if round_desc is None:
+                round_desc = "?"
+            primary_hist = round_data_stats.get("primary_task_hist", {})
+            replay_hist = round_data_stats.get("replay_task_hist", {})
+            def _fmt_hist(hist: dict):
+                if not hist:
+                    return "{}"
+                ordered = sorted(hist.items(), key=lambda kv: int(kv[0]))
+                return "{" + ", ".join([f"T{int(k)}:{int(v)}" for k, v in ordered]) + "}"
+            log_parts = [
+                f"[RoundData] task{self.task_id} client{client_identifier} round={round_desc}",
+                f"epochs={round_data_stats.get('epochs', 0)}",
+                f"primary_task_samples={round_data_stats.get('samples_from_task', 0)}",
+                f"stage_samples={round_data_stats.get('samples_from_stage', 0)}",
+                f"replay_samples={round_data_stats.get('samples_from_replay', 0)}",
+                f"total_batches={round_data_stats.get('total_batches', 0)}",
+            ]
+            if round_data_stats.get("buffer_primary_batches", 0) > 0:
+                log_parts.append(f"buffer_primary_batches={round_data_stats.get('buffer_primary_batches', 0)}")
+            log_parts.append(f"mixed_batches={round_data_stats.get('mixed_batches', 0)}")
+            hist_str = []
+            if primary_hist:
+                hist_str.append(f"primary_hist={_fmt_hist(primary_hist)}")
+            if replay_hist:
+                hist_str.append(f"replay_hist={_fmt_hist(replay_hist)}")
+            if hist_str:
+                log_parts.append(" ".join(hist_str))
+            self.write_log(" ".join(log_parts), prefix="train", should_print=True)
         lr_value = lr.avg if isinstance(lr, AverageMeter) else lr
         return (
             train_losses_arr.avg,

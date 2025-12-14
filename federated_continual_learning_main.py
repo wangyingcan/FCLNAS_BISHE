@@ -27,7 +27,7 @@ from models.normal_nets.proxyless_nets import *
 from models.baseline_nets import BaselineResNet
 from utils.pytorch_utils import create_exp_dir
 from utils.pytorch_utils import accuracy
-from run_manager import CifarRunConfig
+from run_manager import CifarRunConfig, SimpleReplayBuffer
 
 warnings.filterwarnings("ignore")
 
@@ -210,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_round", default=0, type=int, help="start round in fed_search")
     parser.add_argument("--last_round", default=10, type=int, help="last round in fed_search. 125 for all clients. 175 for cpu/gpu.")  # 讨论硬件差异时就多训练些联邦轮次
     parser.add_argument("--retrain_start_round", type=int, default=0, help="重训阶段起始轮次，默认沿用 start_round")
-    parser.add_argument("--retrain_last_round", type=int, default=5, help="重训阶段最后轮次，默认沿用 last_round")
+    parser.add_argument("--retrain_last_round", type=int, default=20, help="重训阶段最后轮次，默认沿用 last_round")
     parser.add_argument("--retrain_sequence_from_task1", action="store_true",
                         help="重训阶段依次从 task1 训练到当前任务，每个任务各跑 retrain_last_round 轮")
     
@@ -583,7 +583,7 @@ def main():
         # ]
         
         args.conv_candidates = [
-            # 'ResNetBlock','DenseNetBlock','SEBlock',
+            'ResNetBlock','DenseNetBlock','SEBlock',
             '3x3_MBConv1', '3x3_MBConv2', '3x3_MBConv3', '3x3_MBConv4', '3x3_MBConv5', '3x3_MBConv6',
             '5x5_MBConv1', '5x5_MBConv2', '5x5_MBConv3', '5x5_MBConv4', '5x5_MBConv5', '5x5_MBConv6',
             '7x7_MBConv1', '7x7_MBConv2', '7x7_MBConv3', '7x7_MBConv4', '7x7_MBConv5', '7x7_MBConv6'
@@ -989,30 +989,63 @@ def main():
                 run_mgr.run_config._train_iter = None
                 run_mgr.run_config._valid_iter = None
                 run_mgr.run_config._test_iter = None
-            def _prefill_replay_buffer(run_mgr: RunManager, prefill_task_id: int, min_required: int = 1):
+            def _rebuild_replay_buffer(run_mgr: RunManager, tasks_to_fill: list):
                 buf = getattr(run_mgr, "replay_buffer", None)
                 if (
                     buf is None
                     or getattr(run_mgr, "replay_mode", "none") == "none"
                     or getattr(run_mgr, "replay_capacity", 0) <= 0
+                    or not tasks_to_fill
                 ):
-                    return 0
-                if len(buf) >= min_required:
-                    return 0
-                loader = run_mgr.run_config.train_loader
-                added = 0
-                for images, labels in loader:
-                    buf.add_batch(images.detach().cpu(), labels.detach().cpu(), prefill_task_id)
-                    added += images.size(0)
+                    return {}
+                buf.clear()
+                stats = {}
+                prev_task = run_mgr.task_id
+                quota = buf.capacity // len(tasks_to_fill) if buf.capacity > 0 else 0
+                for t in tasks_to_fill:
+                    _reset_run_manager_task(run_mgr, t)
+                    added = 0
+                    for images, labels in run_mgr.run_config.train_loader:
+                        buf.add_batch(images.detach().cpu(), labels.detach().cpu(), t)
+                        added += images.size(0)
+                        if quota > 0 and added >= quota:
+                            break
+                        if buf.capacity > 0 and len(buf) >= buf.capacity:
+                            break
+                    stats[t] = added
                     if buf.capacity > 0 and len(buf) >= buf.capacity:
                         break
-                run_mgr.run_config._train_iter = None
+                _reset_run_manager_task(run_mgr, prev_task)
                 hist = buf.task_hist() if hasattr(buf, "task_hist") else {}
                 print(
-                    f"[ReplayPrefill] task{prefill_task_id} -> added={added}, "
-                    f"buffer_size={len(buf)}, hist={hist}"
+                    f"[ReplayPrefill] tasks={tasks_to_fill} quota={quota} buffer_size={len(buf)} hist={hist}"
                 )
-                return added
+                return stats
+            def _build_stage_training_buffer(run_mgr: RunManager, task_to_fill: int):
+                main_buf = getattr(run_mgr, "replay_buffer", None)
+                storage = getattr(main_buf, "storage", []) if main_buf is not None else []
+                task_entries = [e for e in storage if int(e.get("task", -1)) == int(task_to_fill)]
+                if not task_entries:
+                    print(
+                        f"[StageBuffer] task={task_to_fill} 无可用样本，stage_buffer 将为空"
+                    )
+                    return None
+                stage_buf = SimpleReplayBuffer(len(task_entries))
+                stage_buf.storage = [
+                    {
+                        "x": entry["x"].clone(),
+                        "y": entry["y"].clone(),
+                        "task": int(entry.get("task", task_to_fill)),
+                        "t": int(entry.get("t", 0)),
+                    }
+                    for entry in task_entries
+                ]
+                stage_buf._time = max(entry.get("t", 0) for entry in task_entries)
+                hist = stage_buf.task_hist() if hasattr(stage_buf, "task_hist") else {}
+                print(
+                    f"[StageBuffer] task={task_to_fill} stage_size={len(stage_buf)} hist={hist}"
+                )
+                return stage_buf
 
             retrain_task_schedule = list(range(1, task_id + 1)) if args.retrain_sequence_from_task1 else [task_id]
             # 后续 task 的多轮重训不再清理 log，避免覆盖上一任务的记录
@@ -1049,21 +1082,19 @@ def main():
             # retrain_sequence_from_task1 关闭时，先遍历前序任务，为 replay buffer 注入旧样本
             if not args.retrain_sequence_from_task1 and task_id > 1:
                 print(f"[ReplayPrefill] retrain_sequence_from_task1=OFF，预先填充任务 1~{task_id - 1} 的样本到 replay buffer")
-                for prefill_task_id in range(1, task_id):
-                    _reset_run_manager_task(global_run_manager, prefill_task_id)
-                    added_global = _prefill_replay_buffer(global_run_manager, prefill_task_id)
-                    added_clients = []
-                    for client_rm in clients:
-                        _reset_run_manager_task(client_rm, prefill_task_id)
-                        added_clients.append(_prefill_replay_buffer(client_rm, prefill_task_id))
-                    print(
-                        f"[ReplayPrefill] task{prefill_task_id} -> global_added={added_global}, "
-                        f"clients_added={[int(x) for x in added_clients]}"
-                    )
-                # 预填充完成后恢复当前 task_id
+                tasks_to_fill = list(range(1, task_id))
+                _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
+                for client_rm in clients:
+                    _rebuild_replay_buffer(client_rm, tasks_to_fill)
                 _reset_run_manager_task(global_run_manager, task_id)
                 for client_rm in clients:
                     _reset_run_manager_task(client_rm, task_id)
+            elif args.retrain_sequence_from_task1 and task_id > 1:
+                print(f"[ReplayPrefill] retrain_sequence_from_task1=ON，构建 1~{task_id - 1} 混合样本用于随机重放")
+                tasks_to_fill = list(range(1, task_id))
+                _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
+                for client_rm in clients:
+                    _rebuild_replay_buffer(client_rm, tasks_to_fill)
 
             for stage_idx, retrain_task_id in enumerate(retrain_task_schedule):
                 print(f"[Retrain] 开始顺序重训 task {retrain_task_id}/{task_id}")
@@ -1076,28 +1107,27 @@ def main():
                 if args.retrain_sequence_from_task1:
                     global_run_manager.reset_forgetting_stats()
                 if args.retrain_sequence_from_task1 and retrain_task_id < task_id:
-                    added_global = _prefill_replay_buffer(
-                        global_run_manager, retrain_task_id, min_required=global_run_manager.replay_per_batch
+                    global_run_manager.stage_training_buffer = _build_stage_training_buffer(
+                        global_run_manager, retrain_task_id
                     )
-                    added_clients = []
+                    global_run_manager.allow_mix_during_stage = True
                     for client_rm in clients:
+                        client_rm.stage_training_buffer = _build_stage_training_buffer(client_rm, retrain_task_id)
+                        client_rm.allow_mix_during_stage = True
                         _reset_run_manager_task(client_rm, retrain_task_id)
                         if args.retrain_sequence_from_task1:
                             client_rm.reset_forgetting_stats()
-                        added_clients.append(
-                            _prefill_replay_buffer(
-                                client_rm, retrain_task_id, min_required=client_rm.replay_per_batch
-                            )
-                        )
-                    print(
-                        f"[ReplayPrefill] task{retrain_task_id} -> global_added={added_global}, "
-                        f"clients_added={[int(x) for x in added_clients]}"
-                    )
+                    print(f"[ReplayPrefill] task{retrain_task_id} stage buffers ready")
                 else:
                     for client_rm in clients:
                         _reset_run_manager_task(client_rm, retrain_task_id)
                         if args.retrain_sequence_from_task1:
                             client_rm.reset_forgetting_stats()
+                    global_run_manager.stage_training_buffer = None
+                    global_run_manager.allow_mix_during_stage = False
+                    for client_rm in clients:
+                        client_rm.stage_training_buffer = None
+                        client_rm.allow_mix_during_stage = False
                 global_run_manager.replay_only_training = replay_only_stage
                 for client_rm in clients:
                     client_rm.replay_only_training = replay_only_stage
@@ -1148,6 +1178,11 @@ def main():
                 global_run_manager.replay_only_training = False
                 for client_rm in clients:
                     client_rm.replay_only_training = False
+                global_run_manager.stage_training_buffer = None
+                global_run_manager.allow_mix_during_stage = False
+                for client_rm in clients:
+                    client_rm.stage_training_buffer = None
+                    client_rm.allow_mix_during_stage = False
 
             print('所有客户端重训完成')
             # 记录当前任务后每个客户端的 replay buffer，供下一任务复用

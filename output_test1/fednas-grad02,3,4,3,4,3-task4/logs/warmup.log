@@ -1,5 +1,5 @@
-warmup clients_trn_loss 2.7468, clients_trn_top1 14.6667, clients_val_loss 2.4408, clients_val_top1 10.4000, clients_lr 0.0226
-warmup clients_trn_loss 2.7172, clients_trn_top1 16.7333, clients_val_loss 2.8440, clients_val_top1 10.6000, clients_lr 0.0164
-warmup clients_trn_loss 2.6929, clients_trn_top1 17.5778, clients_val_loss 3.3047, clients_val_top1 10.0000, clients_lr 0.0087
-warmup clients_trn_loss 2.6833, clients_trn_top1 17.6222, clients_val_loss 3.3691, clients_val_top1 9.8000, clients_lr 0.0024
-warmup clients_trn_loss 2.6874, clients_trn_top1 17.6889, clients_val_loss 3.5600, clients_val_top1 10.2000, clients_lr 0.0000
+warmup clients_trn_loss 2.6984, clients_trn_top1 17.1556, clients_val_loss 2.7152, clients_val_top1 9.6000, clients_lr 0.0226
+warmup clients_trn_loss 2.6656, clients_trn_top1 19.4222, clients_val_loss 2.7557, clients_val_top1 9.8000, clients_lr 0.0164
+warmup clients_trn_loss 2.6450, clients_trn_top1 19.9111, clients_val_loss 2.3674, clients_val_top1 18.6000, clients_lr 0.0087
+warmup clients_trn_loss 2.6361, clients_trn_top1 20.0000, clients_val_loss 2.3852, clients_val_top1 19.6000, clients_lr 0.0024
+warmup clients_trn_loss 2.6289, clients_trn_top1 21.4444, clients_val_loss 2.3579, clients_val_top1 18.8000, clients_lr 0.0000

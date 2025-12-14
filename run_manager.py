@@ -45,6 +45,10 @@ class SimpleReplayBuffer:
         # 随机删除直至容量限制
         self._rebalance_to_capacity()
 
+    def clear(self):
+        self.storage = []
+        self._time = 0
+
     def sample(self, k: int, mode: str = "global", exclude_task: int = None,
                current_task: int = None, old_task_scale: float = 1.0,
                forgetting_map: dict = None, old_task_scale_by_f: float = 0.0):
@@ -480,6 +484,8 @@ class RunManager:
             self.replay_buffer = SimpleReplayBuffer(self.replay_capacity)
         self.replay_only_training = False
         self._buffer_train_batch_count = None
+        self.stage_training_buffer = None
+        self.allow_mix_during_stage = False
 
     def load_ewc_state(self, state):
         """加载外部保存的 EWC 状态；state=None 时重置。"""
@@ -1333,14 +1339,15 @@ class RunManager:
 
     def _buffer_train_iterator(self, expected_batches: int = None):
         """仅使用 replay buffer 生成训练批次。"""
-        if self.replay_buffer is None or len(self.replay_buffer) == 0:
+        source_buffer = self.stage_training_buffer if self.stage_training_buffer is not None else self.replay_buffer
+        if source_buffer is None or len(source_buffer) == 0:
             return
         batch_size = max(1, int(getattr(self.run_config, "train_batch_size", 32)))
         steps = expected_batches if expected_batches is not None else max(
-            1, math.ceil(len(self.replay_buffer) / batch_size)
+            1, math.ceil(len(source_buffer) / batch_size)
         )
         for _ in range(steps):
-            rep_x, rep_y = self.replay_buffer.sample(
+            rep_x, rep_y = source_buffer.sample(
                 batch_size,
                 mode=self.replay_mode,
                 current_task=self.task_id,
@@ -1416,12 +1423,16 @@ class RunManager:
             
             # 经验回放：先记录当前 batch，稍后加入 buffer；如有重放样本则拼接
             cur_x_cpu, cur_y_cpu = images.detach().cpu(), labels.detach().cpu()
-            if (
+            mix_allowed = (
                 self.replay_mode != "none"
                 and self.replay_per_batch > 0
                 and len(self.replay_buffer) > 0
-                and not getattr(self, "replay_only_training", False)
-            ):
+                and (
+                    not getattr(self, "replay_only_training", False)
+                    or getattr(self, "allow_mix_during_stage", False)
+                )
+            )
+            if mix_allowed:
                 rep_x, rep_y = self.replay_buffer.sample(
                     self.replay_per_batch,
                     mode=self.replay_mode,
@@ -1869,7 +1880,8 @@ class RunManager:
 
         nBatch = len(self.run_config.train_loader)
         if getattr(self, "replay_only_training", False):
-            buffer_len = len(self.replay_buffer) if self.replay_buffer is not None else 0
+            source_buffer = self.stage_training_buffer if self.stage_training_buffer is not None else self.replay_buffer
+            buffer_len = len(source_buffer) if source_buffer is not None else 0
             if buffer_len <= 0:
                 self.write_log(
                     f"[ReplayOnly] task{self.task_id} buffer empty，跳过本地训练",

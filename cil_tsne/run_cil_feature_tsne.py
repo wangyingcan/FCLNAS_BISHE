@@ -227,19 +227,62 @@ def train_single_client(backbone_name: str, args, device: torch.device, save_dir
         else:
             rm.set_teacher(None)
 
-        trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = rm.train_run_manager(
-            start_local_epoch=0,
-            last_local_epoch=args.local_epochs,
-            print_top5=True,
-            server_model=None,
-            writer=writer,
-            global_round_idx=task_id - 1,
-        )
-        print(
-            f"[CIL] task{task_id} loss={trn_loss:.4f} top1={trn_top1:.2f} val_top1={val_top1}"
-        )
+        cur = 0
+        while cur < args.local_epochs:
+            nxt = args.local_epochs if args.ckpt_interval <= 0 else min(cur + args.ckpt_interval, args.local_epochs)
+            trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = rm.train_run_manager(
+                start_local_epoch=cur,
+                last_local_epoch=nxt,
+                print_top5=True,
+                server_model=None,
+                writer=writer,
+                global_round_idx=task_id - 1,
+            )
+            cur = nxt
+            # 分段 checkpoint
+            if args.ckpt_interval > 0:
+                epoch_ckpt = os.path.join(
+                    ckpt_dir, f"cil_{backbone_name}_task{task_id}_epoch{cur}.pth"
+                )
+                torch.save(
+                    {
+                        "state_dict": rm.net.module.state_dict() if isinstance(rm.net, torch.nn.DataParallel) else rm.net.state_dict(),
+                        "task_id": task_id,
+                        "epoch": cur,
+                    },
+                    epoch_ckpt,
+                )
+                print(f"[CIL] saved epoch checkpoint -> {epoch_ckpt}")
+                if args.save_features_every_ckpt:
+                    feat_path_ep = os.path.join(
+                        args.save_dir, f"features_{backbone_name}_task{task_id}_epoch{cur}.npz"
+                    )
+                    extract_features_for_backbone(
+                        backbone_name,
+                        epoch_ckpt,
+                        feat_path_ep,
+                        dataset_root=args.dataset_location,
+                        tasks=tasks,
+                        samples_per_class=args.samples_per_class,
+                        train_batch_size=args.test_batch_size,
+                        num_workers=args.n_worker,
+                        proxyless_config=args.proxyless_config,
+                        dataset=args.dataset,
+                        save_taskwise=args.save_taskwise_features,
+                    )
+        print(f"[CIL] task{task_id} loss={trn_loss:.4f} top1={trn_top1:.2f} val_top1={val_top1}")
         # 每个任务结束后评估一次（累积测试集）
         rm.validate(is_test=True)
+        # 任务级 checkpoint：只存 state_dict，体积较小
+        task_ckpt_path = os.path.join(ckpt_dir, f"cil_{backbone_name}_task{task_id}.pth")
+        torch.save(
+            {
+                "state_dict": rm.net.module.state_dict() if isinstance(rm.net, torch.nn.DataParallel) else rm.net.state_dict(),
+                "task_id": task_id,
+            },
+            task_ckpt_path,
+        )
+        print(f"[CIL] saved task checkpoint -> {task_ckpt_path}")
 
         # 估计 Fisher/ortho 参考，供下一任务遗忘正则
         if args.ewc_lambda > 0:
@@ -285,7 +328,8 @@ def _penultimate_hook(model: nn.Module, backbone_name: str):
 def extract_features_for_backbone(backbone_name: str, checkpoint_path: str, feature_save_path: str,
                                   dataset_root: str, tasks: List[List[int]], samples_per_class: int = 50,
                                   train_batch_size: int = 128, num_workers: int = 2,
-                                  proxyless_config: Optional[str] = None, dataset: str = "CIFAR100"):
+                                  proxyless_config: Optional[str] = None, dataset: str = "CIFAR100",
+                                  save_taskwise: bool = False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = 10 if dataset.lower() == "cifar10" else 100
     model = build_model(backbone_name, num_classes=num_classes, proxyless_config=proxyless_config).to(device)
@@ -300,6 +344,7 @@ def extract_features_for_backbone(backbone_name: str, checkpoint_path: str, feat
     test_set = datasets.CIFAR100(root=dataset_root, train=False, download=False, transform=transform)
 
     feats, labels, task_ids = [], [], []
+    per_task = []
     outputs, handle = _penultimate_hook(model, backbone_name)
     try:
         for task_id, cls_list in enumerate(tasks, start=1):
@@ -323,6 +368,15 @@ def extract_features_for_backbone(backbone_name: str, checkpoint_path: str, feat
                     feats.append(feat_batch)
                     labels.append(lbl)
                     task_ids.append(torch.full_like(lbl, task_id))
+            if save_taskwise:
+                per_task.append(
+                    (
+                        torch.cat(feats[-len(loader):], dim=0) if len(feats) > 0 else torch.empty(0),
+                        torch.cat(labels[-len(loader):], dim=0) if len(labels) > 0 else torch.empty(0),
+                        torch.cat(task_ids[-len(loader):], dim=0) if len(task_ids) > 0 else torch.empty(0),
+                        task_id,
+                    )
+                )
     finally:
         handle.remove()
 
@@ -332,6 +386,17 @@ def extract_features_for_backbone(backbone_name: str, checkpoint_path: str, feat
     np.savez(feature_save_path, feat=feat_arr, label=label_arr, task_id=task_arr,
              backbone=np.array([backbone_name] * len(label_arr)))
     print(f"[Feature] saved {feature_save_path}, feat_shape={feat_arr.shape}")
+    if save_taskwise:
+        base, ext = os.path.splitext(feature_save_path)
+        for ft, lb, tk, tid in per_task:
+            np.savez(
+                f"{base}_task{tid}{ext or '.npz'}",
+                feat=ft.numpy(),
+                label=lb.numpy(),
+                task_id=tk.numpy(),
+                backbone=np.array([backbone_name] * len(lb)),
+            )
+        print(f"[Feature] per-task npz saved -> {base}_task*.npz")
 
 
 def parse_args():
@@ -370,6 +435,10 @@ def parse_args():
     p.add_argument("--ewc_online_interval", type=int, default=0)
     p.add_argument("--save_dir", type=str, default="./cil_tsne_outputs")
     p.add_argument("--samples_per_class", type=int, default=50)
+    p.add_argument("--save_taskwise_features", action="store_true", help="额外按 task 输出 features_xxx_taskN.npz")
+    p.add_argument("--save_features_every_ckpt", action="store_true",
+                   help="在每次 ckpt_interval 到达时额外导出特征 npz（按 epoch 命名）；可能较耗时")
+    p.add_argument("--ckpt_interval", type=int, default=0, help="每隔多少 epoch 存一次 checkpoint（0 关闭）")
     return p.parse_args()
 
 
@@ -390,6 +459,7 @@ def main():
             tasks=tasks, samples_per_class=args.samples_per_class,
             train_batch_size=args.test_batch_size, num_workers=args.n_worker,
             proxyless_config=args.proxyless_config, dataset=args.dataset,
+            save_taskwise=args.save_taskwise_features,
         )
         feature_paths.append(feat_path)
     print("Done. Feature files:", feature_paths)

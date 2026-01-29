@@ -3,6 +3,7 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import colors as mcolors
 from matplotlib.ticker import MaxNLocator
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -28,16 +29,22 @@ def plot_backbones(embeds, colors, titles, out_file, cmap="tab10"):
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 4), squeeze=False)
     for i in range(n):
         ax = axes[0, i]
-        sc = ax.scatter(embeds[i][:, 0], embeds[i][:, 1], c=colors[i], cmap=cmap, s=5, alpha=0.7)
+        vals = np.unique(colors[i])
+        # 将离散任务/类别值映射到 0..K-1，保证颜色与刻度一一对应
+        idx_map = {v: k for k, v in enumerate(sorted(vals))}
+        color_idx = np.vectorize(idx_map.get)(colors[i])
+        cmap_sub = plt.get_cmap(cmap, len(vals))
+        norm = mcolors.Normalize(vmin=0, vmax=len(vals) - 1)
+        sc = ax.scatter(embeds[i][:, 0], embeds[i][:, 1], c=color_idx, cmap=cmap_sub, norm=norm, s=5, alpha=0.7)
         # 去掉顶部 title，保留坐标刻度
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
-        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
         ax.tick_params(labelsize=8)
         if i == n - 1:
             cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            uniq = np.unique(colors[i])
-            cbar.set_ticks(uniq)
-            cbar.set_ticklabels([str(int(u)) for u in uniq])
+            tick_pos = np.arange(len(vals))
+            cbar.set_ticks(tick_pos)
+            cbar.set_ticklabels([str(int(v)) for v in sorted(vals)])
     plt.tight_layout()
     plt.savefig(out_file, dpi=300)
     plt.close(fig)

@@ -168,7 +168,7 @@ def train_single_client(backbone_name: str, args, device: torch.device, save_dir
         dataset_location=args.dataset_location,
         n_epochs=args.local_epochs,
         init_lr=args.init_lr,
-        dataset="CIFAR100",
+        dataset=args.dataset,
         train_batch_size=args.train_batch_size,
         test_batch_size=args.test_batch_size,
         n_worker=args.n_worker,

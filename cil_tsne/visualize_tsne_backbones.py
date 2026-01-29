@@ -51,7 +51,7 @@ def plot_backbones(embeds, colors, titles, out_file, cmap="tab10", s=5, alpha=0.
             cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
             tick_pos = np.arange(len(vals))
             cbar.set_ticks(tick_pos)
-            cbar.set_ticklabels([str(int(v)) for v in sorted(vals)])
+            cbar.set_ticklabels([str(i + 1) for i in range(len(vals))])
     plt.tight_layout()
     plt.savefig(out_file, dpi=300)
     plt.close(fig)

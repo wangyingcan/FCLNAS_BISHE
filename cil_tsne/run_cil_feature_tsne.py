@@ -105,7 +105,7 @@ def build_task_indices(num_classes: int, num_tasks: int, classes_per_task: int, 
     return tasks
 
 
-def make_dataloaders(dataset_root: str, task_classes: List[int], train_batch: int, test_batch: int, num_workers: int):
+def make_dataloaders(dataset_root: str, task_classes: List[int], train_batch: int, test_batch: int, num_workers: int, dataset: str):
     transform_trn = transforms.Compose(
         [transforms.RandomCrop(32, padding=4), transforms.RandomHorizontalFlip(), transforms.ToTensor(),
          transforms.Normalize([0.491, 0.482, 0.447], [0.247, 0.243, 0.262])]
@@ -113,8 +113,12 @@ def make_dataloaders(dataset_root: str, task_classes: List[int], train_batch: in
     transform_tst = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize([0.491, 0.482, 0.447], [0.247, 0.243, 0.262])]
     )
-    train_set = datasets.CIFAR100(root=dataset_root, train=True, download=False, transform=transform_trn)
-    test_set = datasets.CIFAR100(root=dataset_root, train=False, download=False, transform=transform_tst)
+    if dataset.lower() == "cifar10":
+        train_set = datasets.CIFAR10(root=dataset_root, train=True, download=False, transform=transform_trn)
+        test_set = datasets.CIFAR10(root=dataset_root, train=False, download=False, transform=transform_tst)
+    else:
+        train_set = datasets.CIFAR100(root=dataset_root, train=True, download=False, transform=transform_trn)
+        test_set = datasets.CIFAR100(root=dataset_root, train=False, download=False, transform=transform_tst)
 
     def _filter(ds, classes):
         idx = [i for i, y in enumerate(ds.targets) if y in classes]
@@ -155,7 +159,7 @@ def _attach_replay_cfg(run_cfg, args):
 
 
 def train_single_client(backbone_name: str, args, device: torch.device, save_dir: str, tasks: List[List[int]]) -> str:
-    num_classes = 100
+    num_classes = 10 if args.dataset.lower() == "cifar10" else 100
     model = build_model(backbone_name, num_classes=num_classes, proxyless_config=args.proxyless_config)
     model = model.to(device)
 
@@ -281,9 +285,10 @@ def _penultimate_hook(model: nn.Module, backbone_name: str):
 def extract_features_for_backbone(backbone_name: str, checkpoint_path: str, feature_save_path: str,
                                   dataset_root: str, tasks: List[List[int]], samples_per_class: int = 50,
                                   train_batch_size: int = 128, num_workers: int = 2,
-                                  proxyless_config: Optional[str] = None):
+                                  proxyless_config: Optional[str] = None, dataset: str = "CIFAR100"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_model(backbone_name, num_classes=100, proxyless_config=proxyless_config).to(device)
+    num_classes = 10 if dataset.lower() == "cifar10" else 100
+    model = build_model(backbone_name, num_classes=num_classes, proxyless_config=proxyless_config).to(device)
     state = torch.load(checkpoint_path, map_location=device)
     state_dict = state.get("state_dict", state)
     model.load_state_dict(state_dict, strict=False)
@@ -336,6 +341,7 @@ def parse_args():
     p.add_argument("--classes_per_task", type=int, default=20)
     p.add_argument("--proxyless_config", type=str, default=None, help="Proxyless 子网 config 路径，未提供则读取环境变量 PROXYLESS_SUBNET_CONFIG")
     p.add_argument("--dataset_location", type=str, required=True)
+    p.add_argument("--dataset", type=str, default="CIFAR100", choices=["CIFAR100", "CIFAR10"])
     p.add_argument("--train_batch_size", type=int, default=128)
     p.add_argument("--test_batch_size", type=int, default=256)
     p.add_argument("--n_worker", type=int, default=2)
@@ -371,9 +377,10 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.num_tasks * args.classes_per_task != 100:
-        raise ValueError("CIFAR-100 需要 num_tasks × classes_per_task = 100，请检查参数设置")
-    tasks = build_task_indices(num_classes=100, num_tasks=args.num_tasks, classes_per_task=args.classes_per_task, seed=0)
+    num_classes = 10 if args.dataset.lower() == "cifar10" else 100
+    if args.num_tasks * args.classes_per_task != num_classes:
+        raise ValueError(f"{args.dataset} 需要 num_tasks × classes_per_task = {num_classes}，请检查参数设置")
+    tasks = build_task_indices(num_classes=num_classes, num_tasks=args.num_tasks, classes_per_task=args.classes_per_task, seed=0)
     feature_paths = []
     for backbone in args.backbones:
         ckpt = train_single_client(backbone, args, device, args.save_dir, tasks)
@@ -382,7 +389,7 @@ def main():
             backbone, ckpt, feat_path, dataset_root=args.dataset_location,
             tasks=tasks, samples_per_class=args.samples_per_class,
             train_batch_size=args.test_batch_size, num_workers=args.n_worker,
-            proxyless_config=args.proxyless_config,
+            proxyless_config=args.proxyless_config, dataset=args.dataset,
         )
         feature_paths.append(feat_path)
     print("Done. Feature files:", feature_paths)

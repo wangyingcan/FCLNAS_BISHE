@@ -229,7 +229,7 @@ def train_single_client(backbone_name: str, args, device: torch.device, save_dir
             print_top5=True,
             server_model=None,
             writer=writer,
-            round_idx=task_id - 1,
+            global_round_idx=task_id - 1,
         )
         print(
             f"[CIL] task{task_id} loss={trn_loss:.4f} top1={trn_top1:.2f} val_top1={val_top1}"

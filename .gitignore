@@ -3,3 +3,4 @@
 env_dir
 runs
 output_test*
+*.pyc

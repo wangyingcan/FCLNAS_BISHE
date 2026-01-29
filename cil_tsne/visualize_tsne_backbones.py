@@ -3,6 +3,7 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MaxNLocator
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
@@ -28,11 +29,15 @@ def plot_backbones(embeds, colors, titles, out_file, cmap="tab10"):
     for i in range(n):
         ax = axes[0, i]
         sc = ax.scatter(embeds[i][:, 0], embeds[i][:, 1], c=colors[i], cmap=cmap, s=5, alpha=0.7)
-        ax.set_title(titles[i])
-        ax.set_xticks([])
-        ax.set_yticks([])
+        # 去掉顶部 title，保留坐标刻度
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.tick_params(labelsize=8)
         if i == n - 1:
-            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            uniq = np.unique(colors[i])
+            cbar.set_ticks(uniq)
+            cbar.set_ticklabels([str(int(u)) for u in uniq])
     plt.tight_layout()
     plt.savefig(out_file, dpi=300)
     plt.close(fig)

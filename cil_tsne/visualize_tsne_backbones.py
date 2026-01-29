@@ -44,8 +44,11 @@ def main():
     ap.add_argument("--feature_files", nargs="+", required=True, help="三个 npz 路径，按 backbone 顺序给出")
     ap.add_argument("--by", type=str, default="task", choices=["task", "class"], help="上色方式：task 或 class")
     ap.add_argument("--pca_dim", type=int, default=50)
-    ap.add_argument("--out_prefix", type=str, default="tsne_backbone_compare")
+    ap.add_argument("--out_dir", type=str, default="./cil_tsne_outputs", help="图片输出目录")
+    ap.add_argument("--out_prefix", type=str, default="tsne_backbone_compare", help="输出文件名前缀")
     args = ap.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
 
     feats_all, colors_all, titles = [], [], []
     for f in args.feature_files:
@@ -60,7 +63,7 @@ def main():
         titles.append(str(backbone[0]))
 
     suffix = "task" if args.by == "task" else "class"
-    out_file = f"{args.out_prefix}_by_{suffix}.png"
+    out_file = os.path.join(args.out_dir, f"{args.out_prefix}_by_{suffix}.png")
     cmap = "tab10" if args.by == "task" else "tab20"
     plot_backbones(feats_all, colors_all, titles, out_file, cmap=cmap)
 

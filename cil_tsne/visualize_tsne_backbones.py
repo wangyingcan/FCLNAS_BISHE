@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--marker_size", type=float, default=7.0, help="散点大小")
     ap.add_argument("--alpha", type=float, default=0.7, help="散点透明度")
     ap.add_argument("--max_points", type=int, default=None, help="最多使用多少样本做 t-SNE（多余随机下采样）")
+    ap.add_argument("--max_classes", type=int, default=None, help="by class 时随机保留最多多少个类别（如 CIFAR100 抽 20 类）")
     ap.add_argument("--random_state", type=int, default=0)
     args = ap.parse_args()
 
@@ -78,6 +79,16 @@ def main():
     feats_all, colors_all, titles = [], [], []
     for f in args.feature_files:
         feat, label, task, backbone = load_npz(f)
+        # by class 可选随机抽取若干类
+        if args.by == "class" and args.max_classes is not None:
+            rng = random.Random(args.random_state)
+            uniq_cls = list(np.unique(label))
+            rng.shuffle(uniq_cls)
+            keep_cls = set(uniq_cls[: args.max_classes])
+            keep_idx = [i for i, c in enumerate(label) if c in keep_cls]
+            feat = feat[keep_idx]
+            label = label[keep_idx]
+            task = task[keep_idx]
         if args.max_points is not None and feat.shape[0] > args.max_points:
             idx = list(range(feat.shape[0]))
             random.Random(args.random_state).shuffle(idx)

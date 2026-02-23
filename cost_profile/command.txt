@@ -1,0 +1,8 @@
+# 实验1：导出子网并在固定batch下训练记录
+CUDA_VISIBLE_DEVICES=3 python3 cost_profile/run_profile_subnets.py   --device cuda   --num_subnets 40   --batch_size 8   --input_size 3,224,224   --add_extreme_subnets   --cudnn_deterministic   --no_cudnn_benchmark
+
+# 实验1：导出散点图
+CUDA_VISIBLE_DEVICES=3 python3 cost_profile/analyze_cost_profile.py --input_dir cost_profile/outputs
+
+# 计算指标
+python3 cil_tsne/feature_metrics.py   --feature_files cil_tsne_outputs/features_resnet18.npz   --pca_dim 50 --knn_k 5

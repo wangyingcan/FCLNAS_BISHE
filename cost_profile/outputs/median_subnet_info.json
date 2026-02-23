@@ -1,0 +1,9 @@
+{
+  "subnet_id": 8,
+  "batch_size": 8,
+  "flops": 139809923584.0,
+  "params": 3978660,
+  "t_step_ms": 156.88599599525332,
+  "m_step_mb": 15247.87548828125,
+  "config_path": "cost_profile/outputs/subnets/subnet_8.json"
+}

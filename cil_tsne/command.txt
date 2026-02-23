@@ -1,0 +1,8 @@
+# 训练
+nohup python3 cil_tsne/run_cil_feature_tsne.py --backbones proxyless_subnet  --proxyless_config cil_tsne/subnet_config/net.config  --dataset CIFAR100 --num_tasks 1 --classes_per_task 100 --dataset_location /home/wyc/data --local_epochs 150 --replay_capacity 5000 --replay_per_batch 64 --replay_mode age_priority --samples_per_class 100 ckpt_interval 5 save_features_every_ckpt > cil_tsne/subnet.log 2>&1 &
+
+# 导tsne图
+python3 cil_tsne/visualize_tsne_backbones.py   --feature_files cil_tsne_outputs/features_resnet18_200.npz   --by class   --out_prefix tsne_resnet18_200 --max_classes 10
+
+# 计算指标
+python3 cil_tsne/feature_metrics.py   --feature_files cil_tsne_outputs/features_resnet18.npz   --pca_dim 50 --knn_k 5

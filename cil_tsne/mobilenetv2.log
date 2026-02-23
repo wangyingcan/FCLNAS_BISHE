@@ -1,0 +1,217 @@
+nohup: 忽略输入
+CifarRunConfig初始化完成...
+CifarRunConfig初始化完成...
+CifarRunConfig初始化开始... is_client=True client_id=0
+RunManager初始化开始...
+Total training params: 0.82M
+Total FLOPs: 0.0M
+Measure latency for types: None
+[CIL] backbone=small_model task=1 classes=[23, 8, 11, 7, 48, 13, 1, 91, 94, 54, 16, 63, 52, 41, 80, 2, 47, 87, 78, 66, 19, 6, 24, 10, 59, 30, 22, 29, 83, 37, 93, 81, 43, 99, 86, 28, 34, 88, 44, 14, 84, 70, 4, 20, 15, 21, 31, 76, 57, 67, 73, 50, 69, 25, 98, 46, 96, 0, 72, 35, 58, 92, 3, 95, 56, 90, 26, 40, 55, 89, 75, 71, 60, 42, 9, 82, 39, 18, 77, 68, 32, 79, 12, 85, 36, 17, 64, 27, 74, 45, 61, 38, 51, 62, 65, 33, 5, 53, 97, 49]
+[Replay] task1 client0 round_start size=0 hist={} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112576 total_batches=1760 mixed_batches=1759 primary_hist={T1:225000} replay_hist={T1:112576}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch5.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch5.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch10.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch10.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch15.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch15.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch20.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch20.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch25.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch25.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch30.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch30.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch35.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch35.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch40.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch40.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch45.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch45.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch50.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch50.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch55.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch55.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch60.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch60.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch65.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch65.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch70.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch70.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch75.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch75.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch80.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch80.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch85.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch85.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch90.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch90.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch95.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch95.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch100.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch100.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch105.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch105.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch110.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch110.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch115.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch115.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch120.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch120.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch125.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch125.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch130.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch130.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch135.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch135.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch140.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch140.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch145.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch145.npz, feat_shape=(10000, 1280)
+[Replay] task1 client0 round_start size=5000 hist={1: 5000} mode=age_priority per_batch=64 cap=5000
+重训阶段使用测试集进行精度评估
+[Replay] task1 client0 round_end size=5000 hist={1: 5000}
+[RoundData] task1 client0 round=0 epochs=5 primary_task_samples=225000 stage_samples=0 replay_samples=112640 total_batches=1760 mixed_batches=1760 primary_hist={T1:225000} replay_hist={T1:112640}
+[CIL] saved epoch checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1_epoch150.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model_task1_epoch150.npz, feat_shape=(10000, 1280)
+[CIL] task1 loss=1.3633 top1=85.26 val_top1=41.63
+USE: test_loader
+task_class_split: T1: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+per_task_test_top1: T1:41.68
+forgetting_F_max: 0.00; per_task_F: T1:0.00
+[CIL] saved task checkpoint -> ./cil_tsne_outputs/checkpoints/cil_small_model_task1.pth
+[Feature] saved ./cil_tsne_outputs/features_small_model.npz, feat_shape=(10000, 1280)
+Done. Feature files: ['./cil_tsne_outputs/features_small_model.npz']

@@ -6,3 +6,11 @@ CUDA_VISIBLE_DEVICES=3 python3 cost_profile/analyze_cost_profile.py --input_dir 
 
 # 计算指标
 python3 cil_tsne/feature_metrics.py   --feature_files cil_tsne_outputs/features_resnet18.npz   --pca_dim 50 --knn_k 5
+
+# 实验2：3种网络在不同批大小上运行
+CUDA_VISIBLE_DEVICES=3 python3 cost_profile/run_profile_batch.py   --subnet_configs cost_profile/outputs/subnets/subnet_light.json,cost_profile/outputs/subnets/subnet_20.json,cost_profile/outputs/subnets/subnet_heavy.json   --labels light,medium,heavy   --batch_list 4,8,16,32,64,128   --device cuda
+
+# 实验2：结果导出
+CUDA_VISIBLE_DEVICES=3 python3 cost_profile/analyze_batch_overlay.py \
+  --batch_csv cost_profile/outputs/cost_profile_batch.csv \
+  --output_dir cost_profile/outputs/plots

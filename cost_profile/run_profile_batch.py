@@ -27,9 +27,9 @@ def parse_args():
     parser.add_argument('--labels', type=str, default=None,
                         help='与子网对应的标签，逗号分隔（可选，默认用文件名）')
     parser.add_argument('--output_dir', type=str, default='cost_profile/outputs')
-    parser.add_argument('--batch_list', type=str, default='16,32,64,96,128')
-    parser.add_argument('--warmup_steps', type=int, default=10)
-    parser.add_argument('--measure_steps', type=int, default=50)
+    parser.add_argument('--batch_list', type=str, default='4,8,16,32,64,128')
+    parser.add_argument('--warmup_steps', type=int, default=30)
+    parser.add_argument('--measure_steps', type=int, default=150)
     parser.add_argument('--device', type=str, default='cuda')
     return parser.parse_args()
 
@@ -61,8 +61,15 @@ def main():
         net = load_subnet(cfg_path).to(device)
         for b in batch_values:
             try:
-                result = measure_step_cost(net, batch_size=b, steps=args.measure_steps,
-                                           warmup=args.warmup_steps, input_size=(3, 32, 32))
+                result = measure_step_cost(
+                    net,
+                    batch_size=b,
+                    steps=args.measure_steps,
+                    warmup=args.warmup_steps,
+                    input_size=(3, 32, 32),
+                    cudnn_benchmark=False,
+                    cudnn_deterministic=True,
+                )
                 rows.append({
                     'label': label,
                     'batch_size': b,

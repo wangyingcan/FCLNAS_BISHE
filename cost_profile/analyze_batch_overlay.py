@@ -32,12 +32,35 @@ def overlay_plot(rows, y_key, save_path, ylabel_unit):
     plt.figure(figsize=(6, 4))
     labels = sorted(set(r['label'] for r in rows))
     colors = ['tab:blue', 'tab:orange', 'tab:green']
+    xticks = [4, 8, 16, 32, 64, 128]
     for lab, col in zip(labels, colors):
         sub = [r for r in rows if r['label'] == lab]
         b = np.array([float(r['batch_size']) for r in sub])
         y = np.array([float(r[y_key]) for r in sub])
         order = np.argsort(b)
         plt.plot(b[order], y[order], marker='o', color=col, label=lab)
+    plt.xticks(xticks)
+    plt.xlabel('')
+    plt.ylabel('')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def overlay_per_sample(rows, y_key, save_path):
+    """三类子网的每样本开销曲线（y/batch），无轴文案，刻度保留。"""
+    plt.figure(figsize=(6, 4))
+    labels = sorted(set(r['label'] for r in rows))
+    colors = ['tab:blue', 'tab:orange', 'tab:green']
+    xticks = [4, 8, 16, 32, 64, 128]
+    for lab, col in zip(labels, colors):
+        sub = [r for r in rows if r['label'] == lab]
+        b = np.array([float(r['batch_size']) for r in sub])
+        y = np.array([float(r[y_key]) for r in sub]) / b
+        order = np.argsort(b)
+        plt.plot(b[order], y[order], marker='o', color=col, label=lab)
+    plt.xticks(xticks)
     plt.xlabel('')
     plt.ylabel('')
     plt.legend()
@@ -51,6 +74,7 @@ def regression_plot(rows, y_key, save_path, ylabel_unit):
     sub = [r for r in rows if r['label'] == 'medium']
     b = np.array([float(r['batch_size']) for r in sub])
     y = np.array([float(r[y_key]) for r in sub])
+    xticks = [4, 8, 16, 32, 64, 128]
     A = np.vstack([b, np.ones_like(b)]).T
     slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
     x_line = np.linspace(b.min(), b.max(), 100)
@@ -59,6 +83,7 @@ def regression_plot(rows, y_key, save_path, ylabel_unit):
     order = np.argsort(b)
     plt.plot(b[order], y[order], 'o', color='tab:blue', label='medium')
     plt.plot(x_line, y_line, color='tab:red', label=f'y={slope:.4f}x+{intercept:.2f}')
+    plt.xticks(xticks)
     plt.xlabel('')
     plt.ylabel('')
     plt.legend()
@@ -78,6 +103,8 @@ def main():
 
     overlay_plot(rows, 't_step_ms', os.path.join(args.output_dir, 'batch_overlay_t.png'), 'ms')
     overlay_plot(rows, 'm_step_mb', os.path.join(args.output_dir, 'batch_overlay_m.png'), 'MB')
+    overlay_per_sample(rows, 't_step_ms', os.path.join(args.output_dir, 'batch_overlay_t_per_sample.png'))
+    overlay_per_sample(rows, 'm_step_mb', os.path.join(args.output_dir, 'batch_overlay_m_per_sample.png'))
     regression_plot(rows, 't_step_ms', os.path.join(args.output_dir, 'batch_medium_t.png'), 'ms')
     regression_plot(rows, 'm_step_mb', os.path.join(args.output_dir, 'batch_medium_m.png'), 'MB')
 

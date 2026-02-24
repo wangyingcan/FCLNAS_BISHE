@@ -49,13 +49,13 @@ def experiment1(args):
 
     def profile_one(subnet, sid):
         subnet.to(device)
-        F_g, P_m = profile_flops_params(subnet, input_size=(3, 224, 224))
+        F_g, P_m = profile_flops_params(subnet, input_size=args.input_size)
         res = measure_step_cost(
             subnet,
             batch_size=args.exp1_batch,
             steps=args.measure_steps,
             warmup=args.warmup_steps,
-            input_size=(3, 224, 224),
+            input_size=args.input_size,
             cudnn_benchmark=False,
             cudnn_deterministic=True,
         )
@@ -120,7 +120,7 @@ def experiment2(args, reps):
                     batch_size=b,
                     steps=args.measure_steps,
                     warmup=args.warmup_steps,
-                    input_size=(3, 224, 224),
+                    input_size=args.input_size,
                     cudnn_benchmark=False,
                     cudnn_deterministic=True,
                 )
@@ -156,7 +156,8 @@ def parse_args():
     p.add_argument('--num_subnets', type=int, default=50)
     p.add_argument('--width_mult', type=float, default=1.0)
     p.add_argument('--exp1_batch', type=int, default=8)
-    p.add_argument('--exp2_batches', type=str, default='4,8,16,32')
+    p.add_argument('--exp2_batches', type=str, default='4,8,16,32,64,128')
+    p.add_argument('--input_size', type=str, default='3,32,32', help='通道,高,宽')
     p.add_argument('--warmup_steps', type=int, default=30)
     p.add_argument('--measure_steps', type=int, default=150)
     p.add_argument('--seed', type=int, default=2026)
@@ -167,6 +168,7 @@ def parse_args():
 def main():
     args = parse_args()
     args.exp2_batches = [int(x) for x in args.exp2_batches.split(',') if x]
+    args.input_size = tuple(int(x) for x in args.input_size.split(','))
     ensure_dir(args.output_dir)
     rows1 = experiment1(args)
     reps = pick_representative(rows1, k=6)

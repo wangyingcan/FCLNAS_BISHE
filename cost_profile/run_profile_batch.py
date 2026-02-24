@@ -30,6 +30,7 @@ def parse_args():
     parser.add_argument('--batch_list', type=str, default='4,8,16,32,64,128')
     parser.add_argument('--warmup_steps', type=int, default=30)
     parser.add_argument('--measure_steps', type=int, default=150)
+    parser.add_argument('--input_size', type=str, default='3,32,32', help='通道,高,宽')
     parser.add_argument('--device', type=str, default='cuda')
     return parser.parse_args()
 
@@ -44,6 +45,7 @@ def load_subnet(config_path: str) -> ProxylessNASNets:
 def main():
     args = parse_args()
     batch_values = [int(x) for x in args.batch_list.split(',') if x]
+    input_size = tuple(int(x) for x in args.input_size.split(','))
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, 'cost_profile_batch.csv')
 
@@ -66,7 +68,7 @@ def main():
                     batch_size=b,
                     steps=args.measure_steps,
                     warmup=args.warmup_steps,
-                    input_size=(3, 32, 32),
+                    input_size=input_size,
                     cudnn_benchmark=False,
                     cudnn_deterministic=True,
                 )

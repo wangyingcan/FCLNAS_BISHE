@@ -12,8 +12,14 @@ import csv
 import os
 import random
 from statistics import median
+import sys
 
 import torch
+
+# ensure project root on path
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from cost_profile.profiling import build_supernet, sample_subnet, measure_step_cost, profile_flops_params
 

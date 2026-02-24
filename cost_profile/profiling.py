@@ -88,6 +88,16 @@ def _compute_flops_params(model: ProxylessNASNets, batch_size: int, input_size=(
     return flops, params
 
 
+@torch.inference_mode()
+def profile_flops_params(model: ProxylessNASNets, input_size=(3, 224, 224)) -> Tuple[float, float]:
+    """Return (F, P) where F is GFLOPs per sample, P is M parameters."""
+    device = next(model.parameters()).device
+    dummy = torch.randn(1, *input_size, device=device)
+    flops, _ = model.get_flops(dummy)
+    params = sum(p.numel() for p in model.parameters())
+    return flops / 1e9, params / 1e6
+
+
 def measure_step_cost(model: ProxylessNASNets,
                       batch_size: int,
                       steps: int = 50,

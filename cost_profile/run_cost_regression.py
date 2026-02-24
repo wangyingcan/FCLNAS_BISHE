@@ -15,6 +15,7 @@ import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from matplotlib import rcParams
 from sklearn.model_selection import train_test_split
 
@@ -71,7 +72,7 @@ def plot_pred_true(y_true, y_pred, save_path, title, clean=False):
 
 def plot_hist(rel_err, save_path, title, clean=False):
     plt.figure(figsize=(5, 4))
-    plt.hist(rel_err, bins=20, alpha=0.8)
+    plt.hist(rel_err, bins=30, alpha=0.8, color='tab:blue', edgecolor='white')
     if not clean:
         plt.xlabel('Relative Error')
         plt.ylabel('Count')
@@ -95,6 +96,21 @@ def plot_scatter_color(x, y, c, xlabel, ylabel, clabel, save_path, clean=False, 
         plt.ylabel('')
         cb.set_label('')
     plt.tight_layout(); plt.savefig(save_path, dpi=300); plt.close()
+
+
+def plot_3d_scatter(x, y, z, c, xlabel, ylabel, zlabel, clabel, save_path, clean=False, cmap='viridis'):
+    fig = plt.figure(figsize=(6, 5))
+    ax = fig.add_subplot(111, projection='3d')
+    p = ax.scatter(x, y, z, c=c, cmap=cmap, alpha=0.75)
+    if not clean:
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_zlabel(zlabel)
+        cb = fig.colorbar(p, ax=ax, shrink=0.6)
+        cb.set_label(clabel)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300)
+    plt.close(fig)
 
 
 def main():
@@ -140,6 +156,17 @@ def main():
         json.dump(summary, f, indent=2)
     print('Saved regression_cost.json', summary)
 
+    # 追加写入可读文本公式，便于存档引用
+    txt_path = os.path.join(args.output_dir, 'regression_cost.txt')
+    with open(txt_path, 'a') as ftxt:
+        ftxt.write('==============================\n')
+        ftxt.write(f'Total samples: {len(T)}, train: {len(train_idx)}, test: {len(test_idx)}\n')
+        ftxt.write(f'T_step(ms) = {coef_T[0]:.6f}*F(G) + {coef_T[1]:.6f}*P(M) + {coef_T[2]:.6f}*(1/B) + {coef_T[3]:.6f}\n')
+        ftxt.write(f'  R2_train={r2_Ttr:.4f}  R2_test={r2_Tte:.4f}  MSE_train={mse_Ttr:.4f}  MSE_test={mse_Tte:.4f}\n')
+        ftxt.write(f'M_max(MB) = {coef_M[0]:.6f}*F(G) + {coef_M[1]:.6f}*P(M) + {coef_M[2]:.6f}*B + {coef_M[3]:.6f}\n')
+        ftxt.write(f'  R2_train={r2_Mtr:.4f}  R2_test={r2_Mte:.4f}  MSE_train={mse_Mtr:.4f}  MSE_test={mse_Mte:.4f}\n')
+    print('Appended formulas to', txt_path)
+
     # 可视化
     # F vs T/M with P as color
     F = X_T[:,0]; Pval = X_T[:,1]; B = X_M[:,2]
@@ -149,6 +176,22 @@ def main():
                        os.path.join(args.output_dir, 'F_M_colorP.png'), clean=False)
     plot_scatter_color(F, T, Pval, '','', '', os.path.join(args.output_dir, 'F_T_colorP_clean.png'), clean=True)
     plot_scatter_color(F, M, Pval, '','', '', os.path.join(args.output_dir, 'F_M_colorP_clean.png'), clean=True)
+
+    # 3D 三元散点：F, P, 1/B -> T；F, P, B -> M
+    invB = 1.0 / np.array([float(r['batch_size']) for r in rows])
+    Bval = np.array([float(r['batch_size']) for r in rows])
+    plot_3d_scatter(F, Pval, invB, T, xlabel='F (G)', ylabel='P (M)', zlabel='1/B',
+                    clabel='T_step (ms)', save_path=os.path.join(args.output_dir, 'F_P_invB_T_3d.png'),
+                    clean=False, cmap='plasma')
+    plot_3d_scatter(F, Pval, invB, T, xlabel='', ylabel='', zlabel='',
+                    clabel='', save_path=os.path.join(args.output_dir, 'F_P_invB_T_3d_clean.png'),
+                    clean=True, cmap='plasma')
+    plot_3d_scatter(F, Pval, Bval, M, xlabel='F (G)', ylabel='P (M)', zlabel='B',
+                    clabel='M_max (MB)', save_path=os.path.join(args.output_dir, 'F_P_B_M_3d.png'),
+                    clean=False, cmap='magma')
+    plot_3d_scatter(F, Pval, Bval, M, xlabel='', ylabel='', zlabel='',
+                    clabel='', save_path=os.path.join(args.output_dir, 'F_P_B_M_3d_clean.png'),
+                    clean=True, cmap='magma')
 
     # pred vs true & hist (test set)
     plot_pred_true(Tte, pred_Tte, os.path.join(args.output_dir, 'pred_true_T.png'), 'T_step pred vs true', clean=False)

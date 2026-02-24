@@ -30,11 +30,11 @@ def load_csv(path):
 def overlay_plot(rows, y_key, save_path, ylabel_unit):
     """三类子网同图，不做回归，去掉轴文案但保留刻度。"""
     plt.figure(figsize=(6, 4))
-    labels = sorted(set(r['label'] for r in rows))
+    labels = sorted(set(r.get('label', r.get('model_id')) for r in rows))
     colors = ['tab:blue', 'tab:orange', 'tab:green']
     xticks = [4, 8, 16, 32, 64, 128]
     for lab, col in zip(labels, colors):
-        sub = [r for r in rows if r['label'] == lab]
+        sub = [r for r in rows if r.get('label', r.get('model_id')) == lab]
         b = np.array([float(r['batch_size']) for r in sub])
         y = np.array([float(r[y_key]) for r in sub])
         order = np.argsort(b)
@@ -51,11 +51,11 @@ def overlay_plot(rows, y_key, save_path, ylabel_unit):
 def overlay_per_sample(rows, y_key, save_path):
     """三类子网的每样本开销曲线（y/batch），无轴文案，刻度保留。"""
     plt.figure(figsize=(6, 4))
-    labels = sorted(set(r['label'] for r in rows))
+    labels = sorted(set(r.get('label', r.get('model_id')) for r in rows))
     colors = ['tab:blue', 'tab:orange', 'tab:green']
     xticks = [4, 8, 16, 32, 64, 128]
     for lab, col in zip(labels, colors):
-        sub = [r for r in rows if r['label'] == lab]
+        sub = [r for r in rows if r.get('label', r.get('model_id')) == lab]
         b = np.array([float(r['batch_size']) for r in sub])
         y = np.array([float(r[y_key]) for r in sub]) / b
         order = np.argsort(b)
@@ -71,7 +71,7 @@ def overlay_per_sample(rows, y_key, save_path):
 
 def regression_plot(rows, y_key, save_path, ylabel_unit):
     """仅中等子网做回归，轴无文案，保留刻度"""
-    sub = [r for r in rows if r['label'] == 'medium']
+    sub = [r for r in rows if r.get('label', r.get('model_id')) == 'medium']
     b = np.array([float(r['batch_size']) for r in sub])
     y = np.array([float(r[y_key]) for r in sub])
     xticks = [4, 8, 16, 32, 64, 128]

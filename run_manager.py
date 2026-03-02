@@ -1339,6 +1339,17 @@ class RunManager:
                 batch_time.update(time.time() - end)
                 end = time.time()
 
+        if losses.count == 0:
+            loader_name = "test_loader" if is_test else "valid_loader"
+            self.write_log(
+                f"[Validate] no valid batches were processed from {loader_name}; fallback metrics set to 0",
+                prefix="test" if is_test else "valid",
+                should_print=True,
+            )
+            if return_top5:
+                return 0.0, 0.0, 0.0
+            return 0.0, 0.0
+
         if is_test and per_task_total:
             self.last_task_acc = {
                 t: (per_task_correct.get(t, 0) * 100.0 / per_task_total[t])

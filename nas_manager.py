@@ -222,7 +222,15 @@ class ArchSearchRunManager:
         # init weight parameters & build weight_optimizer
         # Super_net is put in RunManager.
         self.run_manager = RunManager(
-            path, super_net, run_config, True, task_id, None, init_model, replay_buffer=replay_buffer
+            path,
+            super_net,
+            run_config,
+            True,
+            task_id,
+            None,
+            init_model,
+            replay_buffer=replay_buffer,
+            run_phase="nas_search",
         )  # idxs=user_groups[idx]
         self.task_id = task_id
         # use GPU to train net
@@ -590,26 +598,12 @@ class ArchSearchRunManager:
         start_local_epoch=0,
         last_local_epoch=10,
         writer=None,
-        teacher_model=None,
-        kd_lambda=0.0,
-        kd_temperature=1.0,
-        reg_lambda=0.0,
-        reg_use_ewc=False,
-        cl_kd_method="none",
-        cl_kd_lambda=None,
-        cl_kd_temperature=None,
-        cl_kd_conf_threshold=0.5,
-        cl_ortho_method="none",
-        cl_ortho_scale=1.0,
-        ortho_samples_per_task=0,
-        cl_penalty_clip=None,
-        arch_replay_lambda=0.0,
     ):
         """
-        超网搜索阶段训练：可选固定权重/更新架构；支持 KD、EWC/锚定正则、正交约束。
-        先同步 server 权重与 teacher，再进入按 epoch/batch 的权重训练与架构更新。
+        干净的 ProxylessNAS 搜索阶段。
+        这里仅保留当前任务上的主任务损失；历史任务回放、EWC、正交更新等
+        遗忘缓解逻辑已移出搜索流程，保存在 legacy_forgetting_in_search.py 中。
         """
-        # ------- 阶段 0：准备基础模型 -------
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
                 net_dict = self.net.state_dict()
@@ -620,45 +614,6 @@ class ArchSearchRunManager:
                 net_dict.update(server_model.state_dict())
                 self.net.load_state_dict(net_dict)
 
-        # ------- 阶段 1：准备 KD / 正则 辅助模型 -------
-        distill_model = self._prepare_distill_model(teacher_model)
-        if distill_model is None and not getattr(self, "_teacher_warned", False):
-            try:
-                self.run_manager.write_log(
-                    f"[KD] task{self.task_id} teacher_model is None, KD/REG/EWC may be skipped",
-                    prefix="train",
-                    should_print=True,
-                )
-            except Exception:
-                pass
-            self._teacher_warned = True
-        eff_kd_lambda = cl_kd_lambda if cl_kd_lambda is not None else kd_lambda
-        eff_kd_temperature = cl_kd_temperature if cl_kd_temperature is not None else kd_temperature
-        eff_kd_method = (cl_kd_method or "none").lower()
-        eff_kd_conf = cl_kd_conf_threshold if cl_kd_conf_threshold is not None else 0.5
-        if distill_model is not None and eff_kd_lambda > 0 and eff_kd_method != "none":
-            print(
-                f"[KD] task{self.task_id} enable distillation: "
-                f"method={eff_kd_method}, lambda={eff_kd_lambda}, T={eff_kd_temperature}, conf={eff_kd_conf}"
-            )
-            
-        reg_anchor_params, fisher_params = self._prepare_reg_anchor(
-            teacher_model, reg_lambda, reg_use_ewc
-        )
-        # kd_ortho 全局参考梯度，与 RunManager 逻辑保持一致
-        kd_ortho_ref_grads = self._maybe_build_kd_ortho_ref(
-            distill_model, eff_kd_lambda, ortho_samples_per_task
-        )
-        # 架构更新时可选加入 replay 批次的 CE，偏向旧任务（默认关闭）
-        self.arch_replay_lambda = arch_replay_lambda
-        # 避免重复打印
-        self._arch_replay_logged = False
-        self._arch_replay_skip_logged = False
-        self._reg_warned = False
-        self._reg_debug_logged = False
-        self._teacher_warned = False
-        
-        # ------- 阶段 2：进入本地训练 -------
         data_loader = self.run_manager.run_config.train_loader
         data_loader = list(data_loader)
         nBatch = len(data_loader)
@@ -668,17 +623,6 @@ class ArchSearchRunManager:
         arch_param_num = len(list(self.net.architecture_parameters()))
         self.entropy = AverageMeter()
         update_schedule = self.arch_search_config.get_update_schedule(nBatch)
-        # 提醒：若只跑一轮且 arch_replay_lambda>0，会因为 epoch==0 跳过架构更新
-        if arch_replay_lambda > 0 and (last_local_epoch - start_local_epoch) <= 1:
-            try:
-                self.run_manager.write_log(
-                    f"[ArchReplay] task{self.task_id} arch updates will be skipped (epoch<=0); "
-                    f"arch_replay_lambda={arch_replay_lambda}",
-                    prefix="arch",
-                    should_print=True,
-                )
-            except Exception:
-                pass
         trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, arch_entropy = (
             None,
             None,
@@ -688,8 +632,7 @@ class ArchSearchRunManager:
             None,
             None,
         )
-        kd_ortho_cos = AverageMeter()  # 监控 kd_ortho 的梯度余弦相似度（仅 kd_ortho 场景）
-       
+
         for epoch in range(start_local_epoch, last_local_epoch):
             batch_time = AverageMeter()
             data_time = AverageMeter()
@@ -713,96 +656,29 @@ class ArchSearchRunManager:
                     images, labels = images.cuda(non_blocking=True), labels.cuda(
                         non_blocking=True
                     )
-                    
-                    # 抽样path
+
                     self.net.reset_binary_gates()  # random sample binary gates
                     self.net.unused_modules_off()  # remove unused module for speedup
                     output = self.run_manager.net(images)
-                    
-                    # teacher 输出（若设置蒸馏）
-                    teacher_output = None
-                    if distill_model is not None and eff_kd_lambda > 0 and eff_kd_method != "none":
-                        with torch.no_grad():
-                            teacher_output = distill_model(images)
-                            
-                    # loss: CE + 可选 KD + 可选锚定正则
-                    total_loss, kd_loss, reg_loss, ewc_penalty = self._build_total_loss_for_search(
-                        output,
-                        labels,
-                        teacher_output,
-                        eff_kd_method,
-                        eff_kd_lambda,
-                        eff_kd_temperature,
-                        eff_kd_conf,
-                        reg_anchor_params,
-                        reg_lambda,
-                        fisher_params,
-                        cl_penalty_clip,
-                    )
-                    
-                    # 正交更新（仅支持 kd_ortho，与 baseline 对齐）
-                    old_grads = None
-                    if (
-                        cl_ortho_method == "kd_ortho"
-                        and teacher_output is not None
-                        and kd_loss is not None
-                        and eff_kd_lambda > 0
-                    ):
-                        if kd_ortho_ref_grads is not None:
-                            old_grads = {n: g.to(self.run_manager.device) for n, g in kd_ortho_ref_grads.items()}
-                        else:
-                            old_grads = self._compute_kd_ortho_reference_from_loss(kd_loss)
-                        
-                    # measure accuracy and record loss
+
+                    if self.run_manager.run_config.label_smoothing > 0:
+                        total_loss = cross_entropy_with_label_smoothing(
+                            output, labels, self.run_manager.run_config.label_smoothing
+                        )
+                    else:
+                        total_loss = self.run_manager.criterion(output, labels)
+
                     acc1, acc5 = accuracy(output, labels, topk=(1, 5))
                     losses.update(total_loss.item(), images.size(0))
                     top1.update(acc1[0].item(), images.size(0))
                     top5.update(acc5[0].item(), images.size(0))
-                    
-                    self.run_manager.net.zero_grad() 
+
+                    self.run_manager.net.zero_grad()
                     total_loss.backward()
-                    
-                    # 若需要，投影梯度到 teacher 引导的正交子空间
-                    if old_grads is not None:
-                        eps = 1e-12
-                        num, denom_cos = 0.0, 0.0
-                        for name, p in self.run_manager.net.named_parameters():
-                            if p.grad is None:
-                                continue
-                            # 兼容 DataParallel 前缀差异
-                            key = name
-                            if key not in old_grads:
-                                key = key.replace("module.", "", 1)
-                            if key not in old_grads:
-                                continue
-                            g = p.grad
-                            g_old = old_grads[key].to(g.device)
-                            num += torch.dot(g.view(-1), g_old.view(-1)).item()
-                            denom_cos += (g.view(-1).norm() * g_old.view(-1).norm()).item() + eps
-                            denom = torch.dot(g_old.view(-1), g_old.view(-1)) + eps
-                            if denom.item() == 0.0:
-                                continue
-                            proj = torch.dot(g.view(-1), g_old.view(-1)) / denom
-                            g_ortho = g.view(-1) - cl_ortho_scale * proj * g_old.view(-1)
-                            p.grad.copy_(g_ortho.view_as(p))
-                        if denom_cos > 0:
-                            kd_ortho_cos.update(num / denom_cos)
-                        elif not getattr(self, "_kd_ortho_debug_logged", False):
-                            try:
-                                self.run_manager.write_log(
-                                    f"[Ortho] task{self.task_id} kd_ortho grads empty: "
-                                    f"old_grads_len={len(old_grads)}, "
-                                    f"kd_ortho_ref={'yes' if kd_ortho_ref_grads is not None else 'no'}",
-                                    prefix="train",
-                                    should_print=True,
-                                )
-                            except Exception:
-                                pass
-                            self._kd_ortho_debug_logged = True
                     torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
                     self.run_manager.optimizer.step()
                     self.net.unused_modules_back()
-                    
+
                 # skip architecture parameter updates in the first epoch
                 if epoch > 0:
                     # update architecture parameters according to update_schedule
@@ -839,26 +715,6 @@ class ArchSearchRunManager:
             writer.add_scalar(tb_prefix + "_train_loss", losses.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top1", top1.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top5", top5.avg, epoch)
-            if cl_ortho_method == "kd_ortho" and kd_ortho_cos.count > 0:
-                writer.add_scalar(tb_prefix + "_kd_ortho_cos", kd_ortho_cos.avg, epoch)
-                # 额外打印到日志，便于在控制台/文件中快速查看
-                try:
-                    self.run_manager.write_log(
-                        f"epoch {epoch} kd_ortho_cos={kd_ortho_cos.avg:.4f}",
-                        prefix="train",
-                        should_print=True,
-                    )
-                except Exception:
-                    pass
-            elif cl_ortho_method == "kd_ortho" and kd_ortho_cos.count == 0:
-                try:
-                    self.run_manager.write_log(
-                        f"epoch {epoch} kd_ortho_cos not computed (no valid grads/ref)",
-                        prefix="train",
-                        should_print=True,
-                    )
-                except Exception:
-                    pass
             # validate
             if (epoch + 1) % self.run_manager.run_config.validation_frequency == 0:
                 (val_loss, val_top1, val_top5), flops, latency = self.validate()
@@ -893,20 +749,10 @@ class ArchSearchRunManager:
         # sample a batch of data from validation set
         images, labels = self.run_manager.run_config.valid_next_batch
         images, labels = images.cuda(non_blocking=True), labels.cuda(non_blocking=True)
-        # replay 参数（若需要旧任务偏好）
-        per_batch = getattr(self.run_manager, "replay_per_batch", 0) or 0
-        use_replay = (
-            getattr(self, "arch_replay_lambda", 0.0) > 0
-            and hasattr(self.run_manager, "replay_buffer")
-            and self.run_manager.replay_buffer is not None
-            and per_batch > 0
-            and len(self.run_manager.replay_buffer) > 0
-        )
         # sample nets and get their validation accuracy, latency, etc
         grad_buffer = []
         reward_buffer = []
         net_info_buffer = []
-        replay_info_logged = False
         for i in range(self.arch_search_config.batch_size):
             self.net.reset_binary_gates()  # random sample binary gates
             self.net.unused_modules_off()  # remove unused module for speedup
@@ -914,54 +760,6 @@ class ArchSearchRunManager:
             with torch.no_grad():
                 output = self.run_manager.net(images)
                 acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-                replay_penalty = 0.0
-                if use_replay:
-                    per_batch_eff = per_batch
-                    if per_batch_eff <= 0 and len(self.run_manager.replay_buffer) > 0:
-                        per_batch_eff = min(len(self.run_manager.replay_buffer), 32)
-                    rep_x, rep_y = self.run_manager.replay_buffer.sample(
-                        per_batch_eff,
-                        mode=getattr(self.run_manager, "replay_mode", "task_balanced"),
-                        replay_old_task_scale=getattr(self.run_manager, "replay_old_task_scale", 1.0),
-                        replay_old_task_scale_by_f=getattr(self.run_manager, "replay_old_task_scale_by_f", 0.0),
-                        task_forgetting=getattr(self.run_manager, "task_forgetting", None),
-                    )
-                    rep_x = rep_x.to(self.run_manager.device)
-                    rep_y = rep_y.to(self.run_manager.device)
-                    rep_out = self.run_manager.net(rep_x)
-                    rep_loss = self.run_manager.criterion(rep_out, rep_y)
-                    replay_penalty = self.arch_replay_lambda * rep_loss.item()
-                    if not replay_info_logged:
-                        try:
-                            self.run_manager.write_log(
-                                f"[ArchReplay-RL] use replay in rl_update_step: per_batch={per_batch_eff}, "
-                                f"lambda={self.arch_replay_lambda}, buffer_size={len(self.run_manager.replay_buffer)}",
-                                prefix="arch",
-                                should_print=True,
-                            )
-                        except Exception:
-                            pass
-                        replay_info_logged = True
-                elif per_batch > 0 and len(self.run_manager.replay_buffer) == 0 and not replay_info_logged:
-                    try:
-                        self.run_manager.write_log(
-                            f"[ArchReplay-RL] skip: buffer empty (per_batch={per_batch}, lambda={self.arch_replay_lambda})",
-                            prefix="arch",
-                            should_print=True,
-                        )
-                    except Exception:
-                        pass
-                    replay_info_logged = True
-                elif per_batch == 0 and not replay_info_logged:
-                    try:
-                        self.run_manager.write_log(
-                            f"[ArchReplay-RL] skip: per_batch=0 (lambda={self.arch_replay_lambda})",
-                            prefix="arch",
-                            should_print=True,
-                        )
-                    except Exception:
-                        pass
-                    replay_info_logged = True
             net_info = {"acc": acc1[0].item()}
             
             # get additional net info for calculating the reward
@@ -979,8 +777,6 @@ class ArchSearchRunManager:
             net_info_buffer.append(net_info)
             # calculate reward according to net_info
             reward = self.arch_search_config.calculate_reward(net_info)
-            if use_replay:
-                reward = reward - replay_penalty
             # loss term
             obj_term = 0
             for m in self.net.redundant_modules:
@@ -1047,62 +843,6 @@ class ArchSearchRunManager:
         time3 = time.time()  # time
         # loss
         ce_loss = self.run_manager.criterion(output, labels)
-        # 可选：混入 replay 批次，对架构参数施加旧任务偏好
-        if (
-            getattr(self, "arch_replay_lambda", 0.0) > 0
-            and hasattr(self.run_manager, "replay_buffer")
-            and self.run_manager.replay_buffer is not None
-        ):
-            per_batch = getattr(self.run_manager, "replay_per_batch", 0) or getattr(
-                self.run_manager.run_config, "replay_per_batch", 0
-            ) or 0
-            # 若未配置但 buffer 有数据，尝试用默认值兜底
-            if per_batch <= 0 and len(self.run_manager.replay_buffer) > 0:
-                per_batch = min(len(self.run_manager.replay_buffer), 32)
-            if per_batch > 0 and len(self.run_manager.replay_buffer) > 0:
-                rep_x, rep_y = self.run_manager.replay_buffer.sample(
-                    per_batch,
-                    mode=getattr(self.run_manager, "replay_mode", "task_balanced"),
-                    replay_old_task_scale=getattr(self.run_manager, "replay_old_task_scale", 1.0),
-                    replay_old_task_scale_by_f=getattr(self.run_manager, "replay_old_task_scale_by_f", 0.0),
-                    task_forgetting=getattr(self.run_manager, "task_forgetting", None),
-                )
-                rep_x = rep_x.to(self.run_manager.device)
-                rep_y = rep_y.to(self.run_manager.device)
-                rep_out = self.run_manager.net(rep_x)
-                rep_loss = self.run_manager.criterion(rep_out, rep_y)
-                ce_loss = ce_loss + self.arch_replay_lambda * rep_loss
-                if not self._arch_replay_logged:
-                    try:
-                        self.run_manager.write_log(
-                            f"[ArchReplay] use replay in gradient_step: per_batch={per_batch}, "
-                            f"lambda={self.arch_replay_lambda}, buffer_size={len(self.run_manager.replay_buffer)}",
-                            prefix="arch",
-                            should_print=True,
-                        )
-                    except Exception:
-                        pass
-                    self._arch_replay_logged = True
-            elif per_batch > 0 and len(self.run_manager.replay_buffer) == 0 and not self._arch_replay_skip_logged:
-                try:
-                    self.run_manager.write_log(
-                        f"[ArchReplay] skip: buffer empty (per_batch={per_batch}, lambda={self.arch_replay_lambda})",
-                        prefix="arch",
-                        should_print=True,
-                    )
-                except Exception:
-                    pass
-                self._arch_replay_skip_logged = True
-            elif per_batch == 0 and not self._arch_replay_skip_logged:
-                try:
-                    self.run_manager.write_log(
-                        f"[ArchReplay] skip: per_batch=0 (lambda={self.arch_replay_lambda})",
-                        prefix="arch",
-                        should_print=True,
-                    )
-                except Exception:
-                    pass
-                self._arch_replay_skip_logged = True
         if self.arch_search_config.target_hardware is None:
             expected_value = None
         elif self.arch_search_config.target_hardware == "mobile":
@@ -1145,19 +885,6 @@ class ArchSearchRunManager:
         start_local_epoch=None,
         last_local_epoch=None,
         writer=None,
-        teacher_model=None,
-        kd_lambda=0.0,
-        kd_temperature=1.0,
-        reg_lambda=0.0,
-        reg_use_ewc=False,
-        cl_kd_method="none",
-        cl_kd_lambda=None,
-        cl_kd_temperature=None,
-        cl_kd_conf_threshold=0.5,
-        cl_ortho_method="none",
-        cl_ortho_scale=1.0,
-        ortho_samples_per_task=0,
-        cl_penalty_clip=None,
     ):
         # ========== Warmup 总览：用当前训练集预训练权重，不更新架构参数 ==========
         if server_model != None:

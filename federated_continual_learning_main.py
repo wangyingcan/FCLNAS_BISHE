@@ -18,9 +18,16 @@ import torch
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")  # 与原逻辑一致
 
+from auto_resume import AutoResumeManager, atomic_torch_save
 from clustering_machine import *
 from data_providers.cifar100_fcl_dirichlet_split import CifarDataProvider100
 from nas_manager import ArchSearchRunManager, GradientArchSearchConfig, RLArchSearchConfig
+from retrain_pipeline import (
+    RetrainPipelineHelpers,
+    run_baseline_retrain_pipeline,
+    run_supernet_retrain_pipeline,
+)
+from runtime_context import RuntimeContext
 from utils_old import *
 from models.super_nets.super_proxyless import *
 from models.normal_nets.proxyless_nets import *
@@ -82,6 +89,17 @@ def model_signature(model: torch.nn.Module) -> dict:
 def set_target_hardware(idx: int):
     """原项目已有同名函数时会覆盖；若无，则此占位用于类型提示。"""
     return ["mobile", "cpu", "gpu8", "flops", None][idx % 5]
+
+
+def parse_optional_bool(value):
+    if value is None or isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def load_prev_task(super_net, prev_task_path: str):
@@ -176,12 +194,99 @@ def _load_state_with_fallback(primary_path: str, fallback_path: str, desc: str):
 def _save_state_safely(state, path: str, desc: str):
     """保存 state dict，保持打印，失败不抛出。"""
     if state is None:
-        return
+        return 0.0
+    start = time.time()
     try:
-        torch.save(state, path)
+        atomic_torch_save(state, path)
         print(f"[{desc}] Saved state to {path}")
     except Exception as e:
         print(f"[{desc}] Failed to save state to {path}: {e}")
+    return max(0.0, time.time() - start)
+
+
+def load_previous_subnet_for_evaluation(learned_net_path: str):
+    net_config_path = os.path.join(learned_net_path, "net.config")
+    if not os.path.isfile(net_config_path):
+        return None
+    try:
+        from models import get_net_by_name
+
+        net_config = json.load(open(net_config_path, "r"))
+        subnet = get_net_by_name(net_config["name"]).build_from_config(net_config)
+        if not load_prev_task(subnet, learned_net_path):
+            return None
+        return subnet
+    except Exception as e:
+        print(f"[QuickEval] Failed to prepare previous subnet from {learned_net_path}: {e}")
+        return None
+
+
+def quick_evaluate_previous_subnet(previous_subnet, run_config, max_batches: int = 1):
+    if previous_subnet is None:
+        return None
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = copy.deepcopy(previous_subnet).to(device)
+    model.eval()
+    criterion = torch.nn.CrossEntropyLoss()
+
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    processed_batches = 0
+    with torch.no_grad():
+        for images, labels in run_config.train_loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            output = model(images)
+            loss = criterion(output, labels)
+            acc1, _ = accuracy(output, labels, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0].item(), images.size(0))
+            processed_batches += 1
+            if processed_batches >= max_batches:
+                break
+    if processed_batches == 0:
+        return None
+    return {
+        "loss": losses.avg,
+        "top1": top1.avg,
+        "batches": processed_batches,
+        "client_id": getattr(run_config, "client_id", None),
+    }
+
+
+def run_nas_search_for_task(args, task_id, global_server, clients, client_indices):
+    # TODO: 使用历史任务原型初始化架构参数 alpha。
+    # TODO: 在此处接入成本约束与搜索门控。
+    search_machine = ClusteringMachine(
+        target_hardware="super_net",
+        config=args,
+        global_server=global_server,
+        clients_idx_arr=client_indices,
+        clients=clients,
+        start_round=args.start_round,
+        last_round=args.last_round,
+        path=args.path,
+        task_id=task_id,
+    )
+    search_machine.run()
+    return search_machine.get_server()
+
+
+def train_personalized_subnet(args, global_run_manager, clients, client_indices, start_round, last_round):
+    # TODO: 在此处接入个性化元学习初始化。
+    retrain_machine = CommonwealthMachine(
+        target_hardware="supernet",
+        config=args,
+        global_run_manager=global_run_manager,
+        clients_idx_arr=client_indices,
+        clients=clients,
+        start_round=start_round,
+        last_round=last_round,
+        path=args.path,
+    )
+    retrain_machine.run()
+    return retrain_machine.get_server()
 
 # ----------------------------- 参数解析与派生 -----------------------------
 def parse_args() -> argparse.Namespace:
@@ -206,6 +311,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path", type=str, default="./output/proxyless-", help="checkpoint save path")
     parser.add_argument("--save_env", type=str, default="EXP", help="experiment time name to save exp code")
     parser.add_argument("--resume", action="store_true", help="load last checkpoint")
+    parser.add_argument("-R", "--auto_resume", action="store_true",
+                        help="自动从最近一次安全保存点继续训练，自动判断 task/phase/round")
     parser.add_argument("--manual_seed", default=0, type=int, help="manual seed to make experiments reproducible")
     parser.add_argument("--start_round", default=0, type=int, help="start round in fed_search")
     parser.add_argument("--last_round", default=10, type=int, help="last round in fed_search. 125 for all clients. 175 for cpu/gpu.")  # 讨论硬件差异时就多训练些联邦轮次
@@ -248,30 +355,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay_per_batch", type=int, default=0, help="每个 batch 从缓冲区重放的样本数")
     parser.add_argument("--replay_old_task_scale", type=float, default=1.0, help="age_priority 模式下旧任务样本的权重缩放，>1 让旧任务更容易被采样")
     parser.add_argument("--replay_old_task_scale_by_F", type=float, default=0.0, help="按遗忘程度动态放大旧任务样本权重，0 表示不启用，单位：每个遗忘点数的放大系数")
+    parser.add_argument("--enable_replay", action="store_true",
+                        help="是否在子网重训阶段启用 replay 模块，默认关闭")
+    parser.add_argument("--enable_ewc", action="store_true",
+                        help="是否在子网重训阶段启用 EWC 模块，默认关闭")
+    parser.add_argument("--enable_kd", action="store_true",
+                        help="是否在子网重训阶段启用 logit KD 模块，默认关闭")
+    parser.add_argument("--enable_orthogonal_update", action="store_true",
+                        help="是否在子网重训阶段启用正交更新模块，默认关闭")
     
     
-    # 分阶段可选覆盖：search_* 用于超网预热/搜索，retrain_* 用于重训；未提供则回落到上述全局参数
-    parser.add_argument("--search_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
-    parser.add_argument("--search_cl_ortho_scale", type=float, default=None)
-    parser.add_argument("--search_ortho_samples_per_task", type=int, default=None)
-    parser.add_argument("--search_cl_kd_method", type=str, default=None, choices=["none","logit","logit_conf"])
-    parser.add_argument("--search_cl_kd_logit_lambda", type=float, default=None)
-    parser.add_argument("--search_cl_kd_temperature", type=float, default=None)
-    parser.add_argument("--search_cl_kd_conf_threshold", type=float, default=None)
-    parser.add_argument("--search_ewc_lambda", type=float, default=None)
-    parser.add_argument("--search_ewc_samples_per_task", type=int, default=None)
-    parser.add_argument("--search_ewc_online_interval", type=int, default=None)
-    parser.add_argument("--search_cl_reg_method", type=str, default=None, choices=["ewc","mas","rwalk"])
-    parser.add_argument("--search_cl_reg_decay", type=float, default=None)
-    parser.add_argument("--search_cl_reg_clip", type=float, default=None)
-    parser.add_argument("--search_cl_penalty_clip", type=float, default=None)
-    parser.add_argument("--search_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
-    parser.add_argument("--search_replay_capacity", type=int, default=None)
-    parser.add_argument("--search_replay_capacity_ratio", type=float, default=None)
-    parser.add_argument("--search_replay_per_batch", type=int, default=None)
-    parser.add_argument("--search_replay_old_task_scale", type=float, default=None)
-    parser.add_argument("--search_replay_old_task_scale_by_F", type=float, default=None)
-    
+    # 分阶段可选覆盖：当前仅保留 retrain_*；search 阶段的遗忘相关覆盖已停用
     parser.add_argument("--retrain_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
     parser.add_argument("--retrain_cl_ortho_scale", type=float, default=None)
     parser.add_argument("--retrain_ortho_samples_per_task", type=int, default=None)
@@ -279,6 +373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrain_cl_kd_logit_lambda", type=float, default=None)
     parser.add_argument("--retrain_cl_kd_temperature", type=float, default=None)
     parser.add_argument("--retrain_cl_kd_conf_threshold", type=float, default=None)
+    parser.add_argument("--retrain_enable_kd", type=parse_optional_bool, default=None)
     parser.add_argument("--retrain_ewc_lambda", type=float, default=None)
     parser.add_argument("--retrain_ewc_samples_per_task", type=int, default=None)
     parser.add_argument("--retrain_ewc_online_interval", type=int, default=None)
@@ -344,16 +439,6 @@ def parse_args() -> argparse.Namespace:
     # architecture search config
     parser.add_argument("--arch_algo", type=str, default="grad", choices=["grad", "rl"],help="architecture search algorithm")
     parser.add_argument("--warmup_n_rounds", type=int, default=5, help="warmup rounds to pretrain supernet before architecture search")
-    parser.add_argument("--arch_replay_lambda", type=float, default=0.0,
-                        help="weight for replay loss when updating architecture parameters (gradient/RL search)")
-    parser.add_argument("--kd_lambda", type=float, default=0.0,
-                        help="distillation loss weight; 0 disables KD, 0.5 means CE/KD各占一半")
-    parser.add_argument("--kd_temperature", type=float, default=2.0,
-                        help="distillation温度，>1 会软化 logits，常见取值 2~4")
-    parser.add_argument("--reg_lambda", type=float, default=1e-1,
-                        help="L2 正则约束当前权重偏离上一轮 teacher，0 表示关闭")
-    parser.add_argument("--reg_use_ewc", action="store_true",
-                        help="开启简单的 EWC 风格：对锚点权重的偏移按 Fisher 近似加权")
     parser.add_argument("--skip_warmup", action="store_true",
                         help="跳过 warmup 阶段，直接进入 search，用于快速验证")
     parser.add_argument("--skip_search", action="store_true",
@@ -390,6 +475,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rl_baseline_decay_weight", type=float, default=0.99, help="baseline decay weight for RL")
     parser.add_argument("--rl_tradeoff_ratio", type=float, default=0.1, help="tradeoff ratio for RL")
 
+    # Archived unused search-stage forgetting arguments (kept here as notes only):
+    # --search_cl_ortho_method
+    # --search_cl_ortho_scale
+    # --search_ortho_samples_per_task
+    # --search_cl_kd_method
+    # --search_cl_kd_logit_lambda
+    # --search_cl_kd_temperature
+    # --search_cl_kd_conf_threshold
+    # --search_ewc_lambda
+    # --search_ewc_samples_per_task
+    # --search_ewc_online_interval
+    # --search_cl_reg_method
+    # --search_cl_reg_decay
+    # --search_cl_reg_clip
+    # --search_cl_penalty_clip
+    # --search_replay_mode
+    # --search_replay_capacity
+    # --search_replay_capacity_ratio
+    # --search_replay_per_batch
+    # --search_replay_old_task_scale
+    # --search_replay_old_task_scale_by_F
+    # --arch_replay_lambda
+    # --kd_lambda
+    # --kd_temperature
+    # --reg_lambda
+    # --reg_use_ewc
+    # They were used by the old "search stage + forgetting mitigation" pipeline.
+    # The current NAS stage is intentionally clean and no longer consumes them.
+
     args = parser.parse_args()
     print("set格式化参数结束...")
 
@@ -404,6 +518,7 @@ def parse_args() -> argparse.Namespace:
             "cl_kd_logit_lambda",
             "cl_kd_temperature",
             "cl_kd_conf_threshold",
+            "enable_kd",
             "ewc_lambda",
             "ewc_samples_per_task",
             "ewc_online_interval",
@@ -499,6 +614,8 @@ def main():
 
     def _load_replay_buffers(task_path: str):
         """从上一任务目录加载 replay buffer 状态，供断点续跑/跨任务继承。"""
+        if not args.enable_replay:
+            return
         buf_path = os.path.join(task_path, "replay_buffers.pt")
         if not os.path.isfile(buf_path):
             return
@@ -517,28 +634,130 @@ def main():
 
     def _save_replay_buffers(task_path: str):
         """将当前 replay buffer 状态保存到任务目录，便于下一任务/断点续跑。"""
+        if not args.enable_replay:
+            return 0.0
         buf_path = os.path.join(task_path, "replay_buffers.pt")
         states = []
         for buf in replay_buffers_across_tasks:
             states.append(buf.export_state() if buf is not None else None)
+        start = time.time()
         try:
-            torch.save(states, buf_path)
+            atomic_torch_save(states, buf_path)
             print(f"[Replay] Saved replay buffers to {buf_path}")
         except Exception as e:
             print(f"[Replay] Failed to save replay buffers to {buf_path}: {e}")
+        return max(0.0, time.time() - start)
+
+    def _load_model_from_checkpoint(model, checkpoint_path: str, desc: str):
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            return False
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print(
+                f"[{desc}] Loaded state_dict from {checkpoint_path}, "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
+            return True
+        except Exception as e:
+            print(f"[{desc}] Failed to load checkpoint {checkpoint_path}: {e}")
+            return False
+
+    def _restore_retrain_bootstrap(checkpoint_path: str, global_run_manager: RunManager, clients: list):
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            return False
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as e:
+            print(f"[AutoResume] Failed to read retrain bootstrap checkpoint {checkpoint_path}: {e}")
+            return False
+
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        global_run_manager.net.module.load_state_dict(state_dict, strict=False)
+        global_run_manager.round = 0
+        for idx, rm in enumerate(clients):
+            rm.net.module.load_state_dict(state_dict, strict=False)
+            rm.round = 0
+            opt_key = f"{idx}_weight_optimizer"
+            if opt_key in checkpoint:
+                try:
+                    rm.optimizer.load_state_dict(checkpoint[opt_key])
+                except Exception as e:
+                    print(f"[AutoResume] Failed to load client {idx} optimizer from {checkpoint_path}: {e}")
+        print(f"[AutoResume] Bootstrapped retrain stage from {checkpoint_path}")
+        return True
+
+    def _load_teacher_snapshot_like(model_template: torch.nn.Module, snapshot_path: str, desc: str):
+        if snapshot_path is None:
+            return None
+        teacher = copy.deepcopy(model_template)
+        if _load_model_from_checkpoint(teacher, snapshot_path, desc=desc):
+            return teacher
+        return None
+
+    retrain_helpers = RetrainPipelineHelpers(
+        attach_replay_cfg=_attach_replay_cfg,
+        load_prev_task=load_prev_task,
+        load_state_with_fallback=_load_state_with_fallback,
+        save_state_safely=_save_state_safely,
+        save_replay_buffers=_save_replay_buffers,
+        load_model_from_checkpoint=_load_model_from_checkpoint,
+        restore_retrain_bootstrap=_restore_retrain_bootstrap,
+        load_teacher_snapshot_like=_load_teacher_snapshot_like,
+        model_signature=model_signature,
+        train_personalized_subnet=train_personalized_subnet,
+    )
 
     # 遍历所有任务
     base_task_path = args.path
+    auto_resume_manager = AutoResumeManager(base_task_path)
+    runtime_context = RuntimeContext()
+    args.runtime_context = runtime_context
+    user_resume = bool(args.resume)
+    user_skip_warmup = bool(args.skip_warmup)
+    user_skip_search = bool(args.skip_search)
+    auto_resume_plan = None
+    if args.auto_resume:
+        auto_resume_plan = auto_resume_manager.resolve(args.num_tasks, args.object_to_search)
+        runtime_context.auto_resume_plan = copy.deepcopy(auto_resume_plan)
+        if auto_resume_plan.get("all_completed"):
+            print("[AutoResume] 所有任务都已完成，无需继续。")
+            return
+        args.start_task_id = int(auto_resume_plan["task_id"])
+        print(
+            f"[AutoResume] 计划从 task {args.start_task_id} 恢复，"
+            f"phase={auto_resume_plan.get('phase')} resume={auto_resume_plan.get('resume', False)}"
+        )
+
     for task_id in range(args.start_task_id, args.num_tasks + 1):
         print(f"开始执行任务 {task_id}/{args.num_tasks}")
         args.task_id = task_id  # 设置当前任务的 task_id
         args.search = True
+        args.resume = user_resume
+        args.skip_warmup = user_skip_warmup
+        args.skip_search = user_skip_search
+        runtime_context.reset_for_task()
+
+        if auto_resume_plan is not None and task_id == int(auto_resume_plan["task_id"]):
+            args.resume = bool(auto_resume_plan.get("resume", False))
+            args.skip_warmup = bool(auto_resume_plan.get("skip_warmup", args.skip_warmup))
+            args.skip_search = bool(auto_resume_plan.get("skip_search", args.skip_search))
+            runtime_context.set_resume_task_plan(auto_resume_plan)
+            print(
+                f"[AutoResume] task{task_id} 使用自动恢复配置: "
+                f"skip_warmup={args.skip_warmup}, skip_search={args.skip_search}, resume={args.resume}"
+            )
+        elif auto_resume_plan is not None and task_id > int(auto_resume_plan["task_id"]):
+            # 仅对首个恢复任务特殊处理，后续任务恢复默认行为
+            auto_resume_plan = None
 
         # 每个任务开始时先恢复 search 阶段的参数配置，避免沿用上轮重训的覆盖值
         _apply_phase_overrides("search")
 
         args.path = base_task_path + f"-task{task_id}"  # 每个任务使用不同的保存路径
         os.makedirs(args.path, exist_ok=True)
+        auto_resume_manager.handle_event(task_id, "task_started", object_to_search=args.object_to_search)
         # 记录命令行，便于复现实验
         try:
             cmd_path = os.path.join(args.path, "command.txt")
@@ -549,8 +768,17 @@ def main():
         # 尝试继承上一任务的超网权重
         prev_task_path = base_task_path + f"-task{task_id - 1}"
         # 断点续跑 / 非首任务：尝试加载上一任务的 replay buffer
-        if args.start_task_id != 1 and replay_buffers_across_tasks.count(None) == len(replay_buffers_across_tasks):
-            _load_replay_buffers(prev_task_path)
+        if (
+            args.enable_replay
+            and replay_buffers_across_tasks.count(None) == len(replay_buffers_across_tasks)
+        ):
+            resume_replay_path = None
+            if runtime_context.resume_task_plan is not None:
+                resume_replay_path = runtime_context.resume_task_plan.get("replay_buffer_path")
+            if resume_replay_path is not None:
+                _load_replay_buffers(os.path.dirname(resume_replay_path))
+            elif task_id > 1:
+                _load_replay_buffers(prev_task_path)
 
         # 组装 run_config
         args.lr_schedule_param = None
@@ -562,6 +790,24 @@ def main():
             run_cfg = CifarRunConfig(**args.__dict__ , is_client = True)
             _attach_replay_cfg(run_cfg, args)
             clients_run_config_arr.append(run_cfg)
+
+        previous_subnet = None
+        if task_id > 1:
+            previous_subnet = load_previous_subnet_for_evaluation(
+                os.path.join(prev_task_path, "learned_net")
+            )
+        quick_eval_metrics = []
+        for run_cfg in clients_run_config_arr:
+            metric = quick_evaluate_previous_subnet(previous_subnet, run_cfg, max_batches=1)
+            if metric is not None:
+                quick_eval_metrics.append(metric)
+        if quick_eval_metrics:
+            avg_loss = sum(item["loss"] for item in quick_eval_metrics) / len(quick_eval_metrics)
+            avg_top1 = sum(item["top1"] for item in quick_eval_metrics) / len(quick_eval_metrics)
+            print(
+                f"[QuickEval] task{task_id} previous_subnet_on_current_task "
+                f"clients={len(quick_eval_metrics)} loss={avg_loss:.4f} top1={avg_top1:.2f}"
+            )
 
         # 解析网络结构相关字符串参数
         def _ensure_int_list(x):
@@ -581,14 +827,9 @@ def main():
         args.width_stages = _ensure_int_list(args.width_stages)
         args.n_cell_stages = _ensure_int_list(args.n_cell_stages)
         args.stride_stages = _ensure_int_list(args.stride_stages)
-
-        # args.conv_candidates = [
-        #     "3x3_MBConv2", "3x3_MBConv3", "3x3_MBConv4",
-        #     "3x3_MBConv5", "3x3_MBConv6", "5x5_MBConv3",
-        # ]
         
         args.conv_candidates = [
-            'ResNetBlock','DenseNetBlock','SEBlock',
+            # 'ResNetBlock','DenseNetBlock','SEBlock',
             '3x3_MBConv1', '3x3_MBConv2', '3x3_MBConv3', '3x3_MBConv4', '3x3_MBConv5', '3x3_MBConv6',
             '5x5_MBConv1', '5x5_MBConv2', '5x5_MBConv3', '5x5_MBConv4', '5x5_MBConv5', '5x5_MBConv6',
             '7x7_MBConv1', '7x7_MBConv2', '7x7_MBConv3', '7x7_MBConv4', '7x7_MBConv5', '7x7_MBConv6'
@@ -661,7 +902,7 @@ def main():
             args.path, super_net, run_config_global_server,
             arch_search_config_global_server, warmup=args.warmup, task_id=args.task_id,
             init_model=not loaded_prev_supernet,
-            replay_buffer=replay_buffers_across_tasks[0] if replay_buffers_across_tasks else None,
+            replay_buffer=None,
         )
         # 继承上一任务的全局优化器状态（在 global_server 创建后再尝试）
         if task_id > 1:
@@ -719,7 +960,7 @@ def main():
                 args.path, local_client_super_net,
                 clients_run_config_arr[idx], asc_local, task_id=args.task_id,
                 init_model=not loaded_prev_supernet,
-                replay_buffer=replay_buffers_across_tasks[idx] if replay_buffers_across_tasks else None,
+                replay_buffer=None,
             )
             _attach_replay_cfg(client.run_manager.run_config, args)
             clients.append(client)
@@ -754,617 +995,67 @@ def main():
             cm.test_inference()
 
         if args.object_to_search == "supernet":
-            # teacher：上一任务固化子网，用于 supernet KD / kd_ortho
-            super_teacher_model = None
-            # 启用 KD / 正交 / 权重锚定(EWC) 任一项，都需要上一任务 teacher
-            need_super_teacher = (
-                args.cl_kd_logit_lambda > 0
-                or args.cl_ortho_method == "kd_ortho"
-                or args.reg_lambda > 0
-                or args.reg_use_ewc
-                or args.ewc_lambda > 0
-            )
-            if need_super_teacher and task_id > 1:
-                try:
-                    # Teacher 使用上一任务的超网 checkpoint（global/warmup），而非 learned 子网
-                    super_teacher_model = SuperProxylessNASNets(
-                        width_stages=args.width_stages, n_cell_stages=args.n_cell_stages,
-                        stride_stages=args.stride_stages, conv_candidates=args.conv_candidates,
-                        n_classes=global_server.run_manager.run_config.data_provider.n_classes,
-                        width_mult=args.width_mult, bn_param=(args.bn_momentum, args.bn_eps),
-                        dropout_rate=args.dropout, inference_device="super_net",
-                    )
-                    loaded_teacher = load_prev_task(super_teacher_model, prev_task_path)
-                    if not loaded_teacher:
-                        super_teacher_model = None
-                        print(f"[Supernet] 未能加载上一任务超网作为 teacher，KD/kd_ortho 将跳过")
-                    else:
-                        print(f"[Supernet] 成功加载上一任务{prev_task_path}超网作为 teacher")
-                except Exception as e:
-                    super_teacher_model = None
-                    print(f"[Supernet] 加载上一任务超网 teacher 失败: {e}")
+            def _search_progress_callback(event, **payload):
+                auto_resume_manager.handle_event(task_id, event, **payload)
+                return 0.0
 
-            # 一、超网训练阶段
+            runtime_context.set_progress_callback(_search_progress_callback)
             if args.skip_search:
                 print("-----------------------------------------------------skip search: directly retrain learned_net-----------------------------------------------------")
             else:
                 print("-----------------------------------------------------case1: training super_net-----------------------------------------------------")
-                # 加载上一任务的 EWC/正交状态并广播到 server & clients，便于跨任务连续正则
-                ewc_state_path = os.path.join(args.path, "ewc_state.pt")
-                prev_ewc_state_path = os.path.join(prev_task_path, "ewc_state.pt")
-                ortho_state_path = os.path.join(args.path, "ortho_state.pt")
-                prev_ortho_state_path = os.path.join(prev_task_path, "ortho_state.pt")
-                # 首任务且非 resume 时，不继承现有 ewc/ortho 文件，避免旧状态污染
-                if task_id == 1 and not getattr(args, "resume", False):
-                    ewc_state, ortho_state = None, None
-                    print("[Supernet] fresh task1 run, skip loading existing ewc/ortho state")
-                else:
-                    ewc_state = _load_state_with_fallback(ewc_state_path, prev_ewc_state_path, desc="Supernet")
-                    ortho_state = _load_state_with_fallback(ortho_state_path, prev_ortho_state_path, desc="Supernet")
-                
-                def _broadcast_state(ewc_s, ortho_s):
-                    global_server.run_manager.load_ewc_state(ewc_s)
-                    global_server.run_manager.load_ortho_state(ortho_s)
-                    for cli in clients:
-                        cli.run_manager.load_ewc_state(ewc_s)
-                        cli.run_manager.load_ortho_state(ortho_s)
-                        
-                _broadcast_state(ewc_state, ortho_state)
-
-                # 先下发 teacher 到 server/client 侧 run_manager，保证 super_cm 期间可用
-                if super_teacher_model is not None:
-                    global_server.run_manager.set_teacher(super_teacher_model)
-                    for cli in clients:
-                        cli.run_manager.set_teacher(super_teacher_model)
-
-                super_cm = ClusteringMachine(
-                    target_hardware="super_net", config=args, global_server=global_server,
-                    clients_idx_arr=all_client_idx_arr, clients=clients,
-                    start_round=args.start_round, last_round=args.last_round, path=args.path,task_id=task_id,
-                    teacher_model=super_teacher_model,
+                super_server = run_nas_search_for_task(
+                    args,
+                    task_id,
+                    global_server,
+                    clients,
+                    all_client_idx_arr,
                 )
-                
-                super_cm.run()
-                super_server = super_cm.get_server()
-                
-                if super_teacher_model is not None:
-                    super_server.run_manager.set_teacher(super_teacher_model)
-                    
-                # 训练完成后保存 EWC/正交状态，供下一任务继承
-                if args.ewc_lambda > 0:
-                    fisher, processed = super_server.run_manager.compute_importance(
-                        max_samples=args.ewc_samples_per_task
-                    )
-                    if fisher is not None:
-                        super_server.run_manager.consolidate_ewc(fisher, update_prev_params=True)
-                        ewc_state = super_server.run_manager.export_ewc_state()
-                        _save_state_safely(ewc_state, ewc_state_path, desc="Supernet")
-                    else:
-                        print(f"[Supernet] Fisher is None (processed={processed}), skip EWC save")
-                        
-                if args.cl_ortho_method != "none" and args.ortho_samples_per_task > 0:
-                    ortho_ref, processed = super_server.run_manager.compute_ortho_reference(
-                        max_samples=args.ortho_samples_per_task
-                    )
-                    if ortho_ref is not None:
-                        ortho_state = super_server.run_manager.export_ortho_state()
-                        _save_state_safely(ortho_state, ortho_state_path, desc="Supernet")
-                    else:
-                        print(f"[Supernet] Ortho ref is None (processed={processed}), skip ortho save")
                 print("完成super_net训练阶段")
-                # 保存本阶段的 replay buffer，便于断点续跑/下一任务复用
-                for idx, cli in enumerate(clients):
-                    replay_buffers_across_tasks[idx] = getattr(cli.run_manager, "replay_buffer", None)
-                _save_replay_buffers(args.path)
-                
-                # 二、固化子网阶段
-                global_server.load_model()
-                global_server.get_normal_net()
+
+                super_server.load_model()
+                super_server.get_normal_net()
+                auto_resume_manager.handle_event(
+                    task_id,
+                    "learned_net_ready",
+                    learned_net_path=os.path.join(args.path, "learned_net"),
+                )
                 print('获取固化网络成功')
             
+            runtime_context.clear_progress_callback()
+            
             # 三、子网重训阶段
-            # 重训阶段可选覆盖
             _apply_phase_overrides("retrain")
-            current_task_path = args.path  # 记录本任务根目录，便于重训结束后保存 replay
-            retrain_path = args.path + '/learned_net'
-            # 如果跳过 search，但 learned_net 不存在，则尝试用当前 global_server 固化出子网
-            if args.skip_search and not os.path.exists(os.path.join(retrain_path, "net.config")):
-                os.makedirs(retrain_path, exist_ok=True)
-                global_server.load_model()
-                global_server.get_normal_net()
-            args.path = retrain_path
-            os.makedirs(args.path, exist_ok=True)
-            
-            args.search = False
-            retrain_start_round = args.start_round if args.retrain_start_round is None else args.retrain_start_round
-            retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
-            
-            args.client_id = 0
-            global_run_config = CifarRunConfig(
-                **args.__dict__,
-                is_client = False
+            current_task_path = args.path
+            run_supernet_retrain_pipeline(
+                args=args,
+                task_id=task_id,
+                prev_task_path=prev_task_path,
+                current_task_path=current_task_path,
+                global_server=super_server,
+                clients_run_config_arr=clients_run_config_arr,
+                replay_buffers_across_tasks=replay_buffers_across_tasks,
+                runtime_context=runtime_context,
+                auto_resume_manager=auto_resume_manager,
+                user_resume=user_resume,
+                helpers=retrain_helpers,
             )
-            _attach_replay_cfg(global_run_config, args)
-            
-            # 加载子网结构与初始权重
-            net_config_path = '%s/net.config' % args.path
-            net = None
-            if os.path.isfile(net_config_path):
-                from models import get_net_by_name
 
-                net_config = json.load(open(net_config_path, 'r'))
-                net = get_net_by_name(net_config['name']).build_from_config(net_config)
-                # 载入超网固化下来的初始权重（由 get_normal_net 保存到 learned_net/init）
-                init_weight_path = os.path.join(args.path, "init")
-                if os.path.isfile(init_weight_path):
-                    try:
-                        ckpt = torch.load(init_weight_path, map_location="cpu")
-                        state_dict = ckpt.get("state_dict", ckpt)
-                        missing, unexpected = net.load_state_dict(state_dict, strict=False)
-                        sig = model_signature(net)
-                        print(f"[Retrain] Loaded init weights from {init_weight_path}, "
-                              f"missing: {len(missing)}, unexpected: {len(unexpected)}, "
-                              f"sig_global_norm={sig.get('global', {}).get('norm'):.4f}")
-                    except Exception as e:
-                        print(f"[Retrain] Failed to load init weights from {init_weight_path}: {e}")
-                else:
-                    print(f"[Retrain] init weight {init_weight_path} not found, start from random init")
-            else:
-                print('net_config_path is not file!')
-
-            # 记录重训开始前的子网签名
-            with open(os.path.join(args.path, f"inherit_check_task{task_id}.log"), "a") as fout:
-                fout.write(json.dumps({
-                    "stage": "retrain_init_net",
-                    "task_id": task_id,
-                    "signature": model_signature(net),
-                }) + "\n")
-
-            # teacher：上一任务子网，用于 KD / kd_ortho
-            teacher_model = None
-            need_teacher = args.cl_kd_logit_lambda > 0 or args.cl_ortho_method == "kd_ortho"
-            if need_teacher and task_id > 1:
-                prev_retrain_path = prev_task_path + "/learned_net"
-                teacher_model = copy.deepcopy(net)
-                loaded_teacher = load_prev_task(teacher_model, prev_retrain_path)
-                if not loaded_teacher:
-                    teacher_model = None
-                    print(f"[Retrain] 未能从 {prev_retrain_path} 加载教师模型，KD/kd_ortho 将跳过")
-            
-            # 全局 run_manager：基于当前子网初始化，后续可能加载 resume
-            global_run_manager = RunManager(
-                args.path, copy.deepcopy(net), global_run_config, init_model=False, task_id=task_id
-            )
-            global_run_manager.save_config(print_info=True)
-            if teacher_model is not None:
-                global_run_manager.set_teacher(teacher_model)
-            
-            # resume 时加载 checkpoint，并用加载后的权重作为初始化
-            base_retrain_state = copy.deepcopy(global_run_manager.net.module.state_dict())
-            
-            clients, \
-            mobile_client_idx_arr, cpu_client_idx_arr, \
-            gpu8_client_idx_arr, flops_client_idx_arr, \
-            None_client_idx_arr, all_client_idx_arr = \
-                [], [], [], [], [], [], []
-
-            for idx in range(args.num_users):
-                all_client_idx_arr.append(idx)
-                idx_target_hardware = set_target_hardware(idx=idx)
-                if idx_target_hardware == 'mobile':
-                    mobile_client_idx_arr.append(idx)
-                elif idx_target_hardware == 'cpu':
-                    cpu_client_idx_arr.append(idx)
-                elif idx_target_hardware == 'gpu8':
-                    gpu8_client_idx_arr.append(idx)
-                elif idx_target_hardware == 'flops':
-                    flops_client_idx_arr.append(idx)
-                elif idx_target_hardware == None:
-                    None_client_idx_arr.append(idx)
-                # 每个客户端使用全局权重的深拷贝进行本地训练，避免互相覆盖
-                client_net = copy.deepcopy(global_run_manager.net.module)
-                client_net.load_state_dict(base_retrain_state, strict=False)
-                client = RunManager(
-                    args.path,
-                    client_net,
-                    clients_run_config_arr[idx],
-                    init_model=False,
-                    task_id=task_id,
-                    replay_buffer=replay_buffers_across_tasks[idx],
-                )
-                _attach_replay_cfg(client.run_config, args)
-                # retrain 阶段需要关闭 search，以便 valid() 使用测试集
-                client.run_config.search = False
-                clients.append(client)
-                if teacher_model is not None:
-                    client.set_teacher(teacher_model)
-                print("The {} user has {} training data and {} test data.".format(idx,
-                    client.run_config.data_provider.trn_set_length,
-                    client.run_config.data_provider.tst_set_length))
-
-            # helper：切换 run_manager 的 task_id 并强制刷新数据加载器
-            def _reset_run_manager_task(run_mgr: RunManager, new_task_id: int):
-                run_mgr.task_id = new_task_id
-                run_mgr.run_config.task_id = new_task_id
-                run_mgr.run_config.search = False
-                # 清空缓存，让数据按新的 task_id 重新划分
-                run_mgr.run_config._data_provider = None
-                run_mgr.run_config._train_iter = None
-                run_mgr.run_config._valid_iter = None
-                run_mgr.run_config._test_iter = None
-            def _rebuild_replay_buffer(run_mgr: RunManager, tasks_to_fill: list):
-                buf = getattr(run_mgr, "replay_buffer", None)
-                if (
-                    buf is None
-                    or getattr(run_mgr, "replay_mode", "none") == "none"
-                    or getattr(run_mgr, "replay_capacity", 0) <= 0
-                    or not tasks_to_fill
-                ):
-                    return {}
-                buf.clear()
-                stats = {}
-                prev_task = run_mgr.task_id
-                quota = buf.capacity // len(tasks_to_fill) if buf.capacity > 0 else 0
-                for t in tasks_to_fill:
-                    _reset_run_manager_task(run_mgr, t)
-                    added = 0
-                    for images, labels in run_mgr.run_config.train_loader:
-                        buf.add_batch(images.detach().cpu(), labels.detach().cpu(), t)
-                        added += images.size(0)
-                        if quota > 0 and added >= quota:
-                            break
-                        if buf.capacity > 0 and len(buf) >= buf.capacity:
-                            break
-                    stats[t] = added
-                    if buf.capacity > 0 and len(buf) >= buf.capacity:
-                        break
-                _reset_run_manager_task(run_mgr, prev_task)
-                hist = buf.task_hist() if hasattr(buf, "task_hist") else {}
-                print(
-                    f"[ReplayPrefill] tasks={tasks_to_fill} quota={quota} buffer_size={len(buf)} hist={hist}"
-                )
-                return stats
-            def _build_stage_training_buffer(run_mgr: RunManager, task_to_fill: int):
-                main_buf = getattr(run_mgr, "replay_buffer", None)
-                storage = getattr(main_buf, "storage", []) if main_buf is not None else []
-                task_entries = [e for e in storage if int(e.get("task", -1)) == int(task_to_fill)]
-                if not task_entries:
-                    print(
-                        f"[StageBuffer] task={task_to_fill} 无可用样本，stage_buffer 将为空"
-                    )
-                    return None
-                stage_buf = SimpleReplayBuffer(len(task_entries))
-                stage_buf.storage = [
-                    {
-                        "x": entry["x"].clone(),
-                        "y": entry["y"].clone(),
-                        "task": int(entry.get("task", task_to_fill)),
-                        "t": int(entry.get("t", 0)),
-                    }
-                    for entry in task_entries
-                ]
-                stage_buf._time = max(entry.get("t", 0) for entry in task_entries)
-                hist = stage_buf.task_hist() if hasattr(stage_buf, "task_hist") else {}
-                print(
-                    f"[StageBuffer] task={task_to_fill} stage_size={len(stage_buf)} hist={hist}"
-                )
-                return stage_buf
-
-            retrain_task_schedule = list(range(1, task_id + 1)) if args.retrain_sequence_from_task1 else [task_id]
-            # 后续 task 的多轮重训不再清理 log，避免覆盖上一任务的记录
-            args.skip_retrain_log_cleanup = False
-            # 保存跨任务的 EWC / 正交统计
-            ewc_state = None
-            ortho_state = None
-
-            def _broadcast_ewc_state(state):
-                global_run_manager.load_ewc_state(state)
-                for rm in clients:
-                    rm.load_ewc_state(state)
-            def _broadcast_ortho_state(state):
-                global_run_manager.load_ortho_state(state)
-                for rm in clients:
-                    rm.load_ortho_state(state)
-            def _set_teacher_all(teacher):
-                global_run_manager.set_teacher(teacher)
-                for rm in clients:
-                    rm.set_teacher(teacher)
-
-            # 加载上一任务的 EWC / ortho
-            ewc_state_path = os.path.join(args.path, "ewc_state.pt")
-            prev_ewc_state_path = os.path.join(prev_task_path + "/learned_net", "ewc_state.pt")
-            ortho_state_path = os.path.join(args.path, "ortho_state.pt")
-            prev_ortho_state_path = os.path.join(prev_task_path + "/learned_net", "ortho_state.pt")
-            ewc_state = _load_state_with_fallback(ewc_state_path, prev_ewc_state_path, desc="Retrain")
-            ortho_state = _load_state_with_fallback(ortho_state_path, prev_ortho_state_path, desc="Retrain")
-
-            _broadcast_ewc_state(ewc_state)
-            _broadcast_ortho_state(ortho_state)
-            if teacher_model is not None:
-                _set_teacher_all(teacher_model)
-            # retrain_sequence_from_task1 关闭时，先遍历前序任务，为 replay buffer 注入旧样本
-            if not args.retrain_sequence_from_task1 and task_id > 1:
-                print(f"[ReplayPrefill] retrain_sequence_from_task1=OFF，预先填充任务 1~{task_id - 1} 的样本到 replay buffer")
-                tasks_to_fill = list(range(1, task_id))
-                _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
-                for client_rm in clients:
-                    _rebuild_replay_buffer(client_rm, tasks_to_fill)
-                _reset_run_manager_task(global_run_manager, task_id)
-                for client_rm in clients:
-                    _reset_run_manager_task(client_rm, task_id)
-            elif args.retrain_sequence_from_task1 and task_id > 1:
-                print(f"[ReplayPrefill] retrain_sequence_from_task1=ON，构建 1~{task_id - 1} 混合样本用于随机重放")
-                tasks_to_fill = list(range(1, task_id))
-                _rebuild_replay_buffer(global_run_manager, tasks_to_fill)
-                for client_rm in clients:
-                    _rebuild_replay_buffer(client_rm, tasks_to_fill)
-
-            for stage_idx, retrain_task_id in enumerate(retrain_task_schedule):
-                print(f"[Retrain] 开始顺序重训 task {retrain_task_id}/{task_id}")
-                if stage_idx > 0:
-                    args.skip_retrain_log_cleanup = True
-                replay_only_stage = (
-                    args.retrain_sequence_from_task1 and retrain_task_id < task_id
-                )
-                _reset_run_manager_task(global_run_manager, retrain_task_id)
-                if args.retrain_sequence_from_task1:
-                    global_run_manager.reset_forgetting_stats()
-                if args.retrain_sequence_from_task1 and retrain_task_id < task_id:
-                    global_run_manager.stage_training_buffer = _build_stage_training_buffer(
-                        global_run_manager, retrain_task_id
-                    )
-                    global_run_manager.allow_mix_during_stage = True
-                    for client_rm in clients:
-                        client_rm.stage_training_buffer = _build_stage_training_buffer(client_rm, retrain_task_id)
-                        client_rm.allow_mix_during_stage = True
-                        _reset_run_manager_task(client_rm, retrain_task_id)
-                        if args.retrain_sequence_from_task1:
-                            client_rm.reset_forgetting_stats()
-                    print(f"[ReplayPrefill] task{retrain_task_id} stage buffers ready")
-                else:
-                    for client_rm in clients:
-                        _reset_run_manager_task(client_rm, retrain_task_id)
-                        if args.retrain_sequence_from_task1:
-                            client_rm.reset_forgetting_stats()
-                    global_run_manager.stage_training_buffer = None
-                    global_run_manager.allow_mix_during_stage = False
-                    for client_rm in clients:
-                        client_rm.stage_training_buffer = None
-                        client_rm.allow_mix_during_stage = False
-                global_run_manager.replay_only_training = replay_only_stage
-                for client_rm in clients:
-                    client_rm.replay_only_training = replay_only_stage
-                # 在当前任务开始前同步上一任务的 EWC 状态
-                _broadcast_ewc_state(ewc_state)
-                _broadcast_ortho_state(ortho_state)
-
-                all_clients = CommonwealthMachine(
-                    target_hardware='supernet',
-                    config=args,
-                    global_run_manager=global_run_manager,
-                    clients_idx_arr=all_client_idx_arr,
-                    clients=clients,
-                    start_round=retrain_start_round,
-                    last_round=retrain_last_round,
-                    path=args.path,
-                )
-                
-                all_clients.run()
-                # 使用本阶段训练完的全局模型继续下一任务
-                global_run_manager = all_clients.get_server()
-                # 保存当前阶段模型，供下个阶段作为 teacher
-                teacher_snapshot_path = os.path.join(args.path, f"teacher_task{retrain_task_id}.pth")
-                try:
-                    torch.save({"state_dict": global_run_manager.net.module.state_dict()}, teacher_snapshot_path)
-                    print(f"[Retrain] Saved teacher snapshot to {teacher_snapshot_path}")
-                except Exception as e:
-                    print(f"[Retrain] Failed to save teacher snapshot: {e}")
-                # 若还有后续阶段，更新 teacher 到最新模型
-                if stage_idx < len(retrain_task_schedule) - 1:
-                    teacher_model = copy.deepcopy(global_run_manager.net.module)
-                    _set_teacher_all(teacher_model)
-                # 训练完成后估计 Fisher，并更新 EWC 状态供下一任务使用
-                if args.ewc_lambda > 0:
-                    fisher, processed = global_run_manager.compute_importance(max_samples=args.ewc_samples_per_task)
-                    global_run_manager.consolidate_ewc(fisher)
-                    ewc_state = global_run_manager.export_ewc_state()
-                    _save_state_safely(ewc_state, ewc_state_path, desc="Retrain")
-                # 训练完成后估计 ortho 参考
-                if args.cl_ortho_method != "none" and args.ortho_samples_per_task > 0:
-                    ortho_ref, processed = global_run_manager.compute_ortho_reference(
-                        max_samples=args.ortho_samples_per_task
-                    )
-                    if ortho_ref is not None:
-                        ortho_state = global_run_manager.export_ortho_state()
-                        _save_state_safely(ortho_state, ortho_state_path, desc="Retrain")
-                print(f"[Retrain] task {retrain_task_id} 重训完成")
-                global_run_manager.replay_only_training = False
-                for client_rm in clients:
-                    client_rm.replay_only_training = False
-                global_run_manager.stage_training_buffer = None
-                global_run_manager.allow_mix_during_stage = False
-                for client_rm in clients:
-                    client_rm.stage_training_buffer = None
-                    client_rm.allow_mix_during_stage = False
-
-            print('所有客户端重训完成')
-            # 记录当前任务后每个客户端的 replay buffer，供下一任务复用
-            for idx, rm in enumerate(clients):
-                replay_buffers_across_tasks[idx] = rm.replay_buffer
-            _save_replay_buffers(current_task_path)
 
         elif args.object_to_search == "baseline":
             print(line_info()); print("-----------------------------case baseline: fixed backbone--------------------------------")
             _apply_phase_overrides("retrain")
-            args.search = False
-            args.client_id = 0
-            global_run_config = CifarRunConfig(**args.__dict__, is_client=False)
-            _attach_replay_cfg(global_run_config, args)
-            global_net = BaselineResNet(
-                arch=args.baseline_arch,
-                num_classes=global_run_config.data_provider.n_classes,
-                pretrained=args.baseline_pretrained,
+            current_task_path = args.path
+            run_baseline_retrain_pipeline(
+                args=args,
+                task_id=task_id,
+                prev_task_path=prev_task_path,
+                current_task_path=current_task_path,
+                replay_buffers_across_tasks=replay_buffers_across_tasks,
+                runtime_context=runtime_context,
+                auto_resume_manager=auto_resume_manager,
+                helpers=retrain_helpers,
             )
-            
-            teacher_model = None
-            loaded_prev = False
-            # 加载上一任务的模型权重
-            if task_id > 1:
-                try:
-                    loaded_prev = load_prev_task(global_net, prev_task_path)
-                except Exception as e:
-                    print(f"[Baseline] 尝试从 {prev_task_path} 加载上一任务权重失败: {e}")
-                    loaded_prev = False
-
-            if not loaded_prev:
-                print(f"[Baseline] 未找到上一任务权重，task {task_id} 从随机初始化开始")
-                global_net.init_model(args.model_init, args.init_div_groups)
-            else:
-                print(f"[Baseline] 已从 {prev_task_path} 继承权重，task {task_id} 在上一任务模型上继续训练")
-                
-                # 初始化教师模型
-                need_teacher = args.cl_kd_logit_lambda > 0 or args.cl_ortho_method == "kd_ortho"
-                if need_teacher:
-                    teacher_model = BaselineResNet(
-                        arch=args.baseline_arch,
-                        num_classes=global_run_config.data_provider.n_classes,
-                        pretrained=args.baseline_pretrained,
-                    )
-                    teacher_model.load_state_dict(copy.deepcopy(global_net.state_dict()), strict=False)
-                    
-                    print(f"[Baseline] 已从 {prev_task_path} 继承教师模型")
-                
-            base_fixed_state = copy.deepcopy(global_net.state_dict())
-            global_run_manager = RunManager(
-                args.path, global_net, global_run_config, init_model=False, task_id=task_id
-            )
-            global_run_manager.save_config(print_info=True)
-            if teacher_model is not None:
-                global_run_manager.set_teacher(teacher_model)
-
-            clients, all_client_idx_arr = [], []
-            for idx in range(args.num_users):
-                args.client_id = idx
-                client_run_config = CifarRunConfig(**args.__dict__, is_client=True)
-                _attach_replay_cfg(client_run_config, args)
-                client_run_config.search = False
-                client_net = BaselineResNet(
-                    arch=args.baseline_arch,
-                    num_classes=client_run_config.data_provider.n_classes,
-                    pretrained=args.baseline_pretrained,
-                )
-                client_net.load_state_dict(base_fixed_state, strict=False)
-                client = RunManager(
-                    args.path,
-                    client_net,
-                    client_run_config,
-                    init_model=False,
-                    task_id=task_id,
-                    replay_buffer=replay_buffers_across_tasks[idx],
-                )
-                clients.append(client)
-                all_client_idx_arr.append(idx)
-                print("The {} user has {} training data and {} test data.".format(
-                    idx,
-                    client.run_config.data_provider.trn_set_length,
-                    client.run_config.data_provider.tst_set_length,
-                ))
-                
-                # 为每个客户端下发教师模型
-                if teacher_model is not None:
-                    for client in clients:
-                        client.set_teacher(teacher_model)
-
-            all_clients = CommonwealthMachine(
-                target_hardware=args.baseline_arch,
-                config=args,
-                global_run_manager=global_run_manager,
-                clients_idx_arr=all_client_idx_arr,
-                clients=clients,
-                start_round=args.retrain_start_round,
-                last_round=args.retrain_last_round,
-                path=args.path,
-            )
-            
-            ewc_state_path = os.path.join(args.path, "ewc_state.pt")
-            prev_ewc_state_path = os.path.join(prev_task_path, "ewc_state.pt")
-            ewc_state = None
-            
-            # 加载上一任务的 EWC 状态
-            if os.path.isfile(ewc_state_path):
-                try:
-                    ewc_state = torch.load(ewc_state_path, map_location="cpu")
-                    print(f"[Baseline] Loaded EWC state from {ewc_state_path}")
-                except Exception as e:
-                    print(f"[Baseline] Failed to load EWC state: {e}")
-            elif os.path.isfile(prev_ewc_state_path):
-                try:
-                    ewc_state = torch.load(prev_ewc_state_path, map_location="cpu")
-                    print(f"[Baseline] Loaded EWC state from prev task {prev_ewc_state_path}")
-                except Exception as e:
-                    print(f"[Baseline] Failed to load prev-task EWC state: {e}")
-                    
-            def _broadcast_ewc_state(state):
-                global_run_manager.load_ewc_state(state)
-                for rm in clients:
-                    rm.load_ewc_state(state)
-
-            _broadcast_ewc_state(ewc_state)
-            
-            # 加载上一任务的正交参考状态
-            ortho_state = None
-            ortho_state_path = os.path.join(prev_task_path, "ortho_state.pt")  # 或当前 task 目录
-            if os.path.isfile(ortho_state_path):
-                ortho_state = torch.load(ortho_state_path, map_location="cpu")
-                
-            # 给 global & clients 广播
-            global_run_manager.load_ortho_state(ortho_state)
-            for client in clients:
-                client.load_ortho_state(ortho_state)
-            
-            all_clients.run()
-            # 记录当前任务的 replay buffer，供下一任务复用
-            for idx, rm in enumerate(clients):
-                replay_buffers_across_tasks[idx] = rm.replay_buffer
-            _save_replay_buffers(args.path)
-            
-            # 保存 EWC 正则化模型
-            if args.ewc_lambda > 0:
-                print(f"[Baseline] 计算并整合 Fisher 信息，lambda={args.ewc_lambda}")
-                fisher, processed = global_run_manager.compute_importance(max_samples=args.ewc_samples_per_task)
-                if fisher is None:
-                    print(f"[Baseline] Fisher/importance is None (processed={processed}), skip consolidate")
-                else:
-                    global_run_manager.consolidate_ewc(fisher, update_prev_params=True)
-                    ewc_state = global_run_manager.export_ewc_state()
-                    print(f"[Baseline] Importance_keys={len(fisher)}, importance_norm={sum(v.sum().item() for v in fisher.values()):.4f}, processed={processed}")
-                    try:
-                        torch.save(ewc_state, ewc_state_path)
-                        print(f"[Baseline] Saved EWC state to {ewc_state_path}")
-                    except Exception as e:
-                        print(f"[Baseline] Failed to save EWC state: {e}")
-                        
-            # 保存正交模型
-            if args.cl_ortho_method != "none" and args.ortho_samples_per_task > 0:
-                ortho_ref, processed = global_run_manager.compute_ortho_reference(
-                    max_samples=args.ortho_samples_per_task
-                )
-                if ortho_ref is not None and isinstance(ortho_ref, dict):
-                    # 统计范数（若存在 global 键则用 global，否则取所有梯度范数之和）
-                    if "global" in ortho_ref:
-                        ref_norm = ortho_ref["global"].norm()
-                    else:
-                        ref_norm = sum(v.norm() for v in ortho_ref.values())
-                    print(f"[Baseline] Ortho ref norm={ref_norm:.4f}, processed={processed}")
-                    ortho_state = global_run_manager.export_ortho_state()
-                    ortho_state_path = os.path.join(args.path, "ortho_state.pt")
-                    try:
-                        torch.save(ortho_state, ortho_state_path)
-                        print(f"[Baseline] Saved ortho state to {ortho_state_path}")
-                    except Exception as e:
-                        print(f"[Baseline] Failed to save ortho state: {e}")
-                else:
-                    print(f"[Baseline] Ortho ref is None (processed={processed}), skip saving ortho_state")
 
 
         elif args.object_to_search == "cpu":
@@ -1379,6 +1070,7 @@ def main():
         elif args.object_to_search is None:
             _run_pruning_case(None, none_client_idx_arr, "--------------------------------------case5: pruning for None------------------------------------------")
 
+        auto_resume_manager.handle_event(task_id, "task_completed")
         print(f"任务 {task_id}/{args.num_tasks} 完成！")
 
 if __name__ == "__main__":

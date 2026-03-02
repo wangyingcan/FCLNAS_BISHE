@@ -24,6 +24,16 @@ import torch.nn.functional as F
 
 import random
 
+from auto_resume import atomic_torch_save
+from forgetting_mitigation import (
+    apply_ewc_regularization,
+    apply_orthogonal_update,
+    apply_replay_loss,
+    ewc_is_enabled,
+    orthogonal_update_is_enabled,
+    replay_is_enabled,
+)
+
 # 简易经验回放 buffer（全局/任务均衡）
 class SimpleReplayBuffer:
     def __init__(self, capacity: int):
@@ -381,6 +391,7 @@ class RunManager:
         measure_latency=None,
         init_model=True,
         replay_buffer=None,
+        run_phase="standard",
     ):
         print("RunManager初始化开始...")
         self.path = path
@@ -388,6 +399,7 @@ class RunManager:
         self.run_config = run_config
         self.out_log = out_log
         self.task_id = task_id
+        self.run_phase = run_phase
 
         self._logs_path, self._save_path = None, None
         self.best_acc = 0
@@ -473,6 +485,14 @@ class RunManager:
         self.prev_kd_grads = None  # dict[name] = tensor on CPU
         self.prev_kd_grads_history = []  # list[dict], 维护多轮 KD 参考
         
+        search_phase = self.run_phase == "nas_search"
+        self.enable_kd = bool(getattr(run_config, "enable_kd", False)) and not search_phase
+        self.enable_replay = bool(getattr(run_config, "enable_replay", False)) and not search_phase
+        self.enable_ewc = bool(getattr(run_config, "enable_ewc", False)) and not search_phase
+        self.enable_orthogonal_update = (
+            bool(getattr(run_config, "enable_orthogonal_update", False)) and not search_phase
+        )
+
         # 重放配置
         self.replay_mode = str(getattr(run_config, "replay_mode", "none")).lower()
         self.replay_capacity = int(getattr(run_config, "replay_capacity", 0))
@@ -695,10 +715,12 @@ class RunManager:
         会自动跳过当前网络中不存在或 shape 不匹配的参数（兼容不同 backbone）。"""
         if not state:
             self.ortho_ref_grads = None
+            self.prev_grads = None
             self.prev_kd_grads = None
             self.prev_kd_grads_history = []
             return
         grads = state.get("grads", None)
+        prev_grads = state.get("prev_grads", None)
         kd_prev = state.get("kd_prev_grads", None)
         if grads is None:
             self.ortho_ref_grads = None
@@ -710,6 +732,16 @@ class RunManager:
                 if name in cur_params and cur_params[name].shape == g.shape:
                     filtered[name] = g.clone()
             self.ortho_ref_grads = filtered if filtered else None
+
+        if prev_grads is not None:
+            cur_params = dict(self.net.module.named_parameters())
+            filtered_prev = {}
+            for name, g in prev_grads.items():
+                if name in cur_params and cur_params[name].shape == g.shape:
+                    filtered_prev[name] = g.clone()
+            self.prev_grads = filtered_prev if filtered_prev else None
+        else:
+            self.prev_grads = None
 
         # 处理 kd_prev_grad_ortho 的参考梯度
         if kd_prev is not None:
@@ -726,11 +758,13 @@ class RunManager:
 
     def export_ortho_state(self):
         """导出当前累积的正交参考梯度方向."""
-        if self.ortho_ref_grads is None and self.prev_kd_grads is None:
+        if self.ortho_ref_grads is None and self.prev_grads is None and self.prev_kd_grads is None:
             return None
         state = {}
         if self.ortho_ref_grads is not None:
             state["grads"] = {k: v.clone() for k, v in self.ortho_ref_grads.items()}
+        if self.prev_grads is not None:
+            state["prev_grads"] = {k: v.clone() for k, v in self.prev_grads.items()}
         if self.prev_kd_grads is not None:
             state["kd_prev_grads"] = {k: v.clone() for k, v in self.prev_kd_grads.items()}
         # 为避免膨胀，不序列化 history，history 由当前任务内维护
@@ -1097,11 +1131,11 @@ class RunManager:
         model_path = os.path.join(self.save_path, model_name)
         with open(latest_fname, "w") as fout:
             fout.write(model_path + "\n")
-        torch.save(checkpoint, model_path)
+        atomic_torch_save(checkpoint, model_path)
 
         if is_best:
             best_path = os.path.join(self.save_path, "model_best.pth.tar")
-            torch.save({"state_dict": checkpoint["state_dict"]}, best_path)
+            atomic_torch_save({"state_dict": checkpoint["state_dict"]}, best_path)
 
         # --------- 简单清理：仅保留最近若干个 checkpoint，避免线性膨胀 ---------
         try:
@@ -1415,7 +1449,8 @@ class RunManager:
         # - 其他 ortho：若还没有 ortho_ref_grads，尝试基于当前任务数据估计
         # - prev_grad_ortho / kd_prev_grad_ortho：参考来自上一轮梯度，训练过程中动态更新，无需预估
         if (
-            self.cl_ortho_method == "kd_ortho"
+            orthogonal_update_is_enabled(self)
+            and self.cl_ortho_method == "kd_ortho"
             and self.teacher_model is not None
             and self.cl_kd_logit_lambda > 0
         ):
@@ -1423,6 +1458,8 @@ class RunManager:
                 max_samples=self.ortho_samples_per_task
             )
         elif (
+            orthogonal_update_is_enabled(self)
+            and
             self.cl_ortho_method != "none"
             and self.cl_ortho_method != "kd_ortho"
             and self.ortho_ref_grads is None
@@ -1445,7 +1482,7 @@ class RunManager:
         end = time.time()
         ewc_meter = AverageMeter()
 
-        if getattr(self, "replay_only_training", False):
+        if getattr(self, "replay_only_training", False) and replay_is_enabled(self):
             data_iterable = self._buffer_train_iterator(self._buffer_train_batch_count)
         else:
             data_iterable = self.run_config.train_loader
@@ -1480,40 +1517,12 @@ class RunManager:
                         "samples_from_task", 0
                     ) + primary_count
                     self._accumulate_label_hist(cur_y_cpu, round_data_meter.get("primary_task_hist"))
-            mix_allowed = (
-                self.replay_mode != "none"
-                and self.replay_per_batch > 0
-                and len(self.replay_buffer) > 0
-                and (
-                    not getattr(self, "replay_only_training", False)
-                    or getattr(self, "allow_mix_during_stage", False)
-                )
+            images, labels = apply_replay_loss(
+                self,
+                images,
+                labels,
+                round_data_meter=round_data_meter,
             )
-            if mix_allowed:
-                rep_x, rep_y = self.replay_buffer.sample(
-                    self.replay_per_batch,
-                    mode=self.replay_mode,
-                    exclude_task=None if self.replay_mode == "global" else None,
-                    current_task=self.task_id,
-                    old_task_scale=self.replay_old_task_scale,
-                    forgetting_map=getattr(self, "task_forgetting", None),
-                    old_task_scale_by_f=self.replay_old_task_scale_by_f,
-                )
-                if rep_x is not None and rep_y is not None and rep_x.numel() > 0:
-                    rep_count = rep_x.size(0)
-                    rep_y_cpu = rep_y
-                    if round_data_meter is not None and rep_count > 0:
-                        round_data_meter["samples_from_replay"] = round_data_meter.get(
-                            "samples_from_replay", 0
-                        ) + rep_count
-                        round_data_meter["mixed_batches"] = round_data_meter.get(
-                            "mixed_batches", 0
-                        ) + 1
-                        self._accumulate_label_hist(rep_y_cpu, round_data_meter.get("replay_task_hist"))
-                    rep_x = rep_x.to(self.device, non_blocking=True)
-                    rep_y = rep_y_cpu.to(self.device, non_blocking=True)
-                    images = torch.cat([images, rep_x], dim=0)
-                    labels = torch.cat([labels, rep_y], dim=0)
             
 
             # ========== 前向 ==========
@@ -1537,14 +1546,15 @@ class RunManager:
                 ce_loss = torch.zeros_like(ce_loss)
 
             # EWC / MAS / RWalk 正则项
-            ewc_penalty = self._ewc_penalty()
-            if ewc_penalty is not None and torch.isfinite(ewc_penalty):
+            ewc_penalty = apply_ewc_regularization(self)
+            if ewc_penalty is not None:
                 ewc_meter.update(ewc_penalty.item(), images.size(0))
 
             # ========== KD logit loss（只算数值，真正用在哪取决于模式）==========
             kd_loss = None
             if (
-                self.teacher_model is not None
+                self.enable_kd
+                and self.teacher_model is not None
                 and self.cl_kd_logit_lambda > 0
                 and self.cl_kd_method in ["logit", "logit_conf"]
             ):
@@ -1577,7 +1587,7 @@ class RunManager:
             total_loss = ce_loss
             if kd_loss is not None:
                 total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
-            if ewc_penalty is not None and torch.isfinite(ewc_penalty):
+            if ewc_penalty is not None:
                 penalty_term = self.ewc_lambda * ewc_penalty
                 if self.cl_penalty_clip is not None:
                     penalty_term = torch.clamp(
@@ -1585,116 +1595,14 @@ class RunManager:
                     )
                 total_loss = total_loss + penalty_term
 
-            # ========== kd_ortho 特殊逻辑 ==========
-            cos_before, cos_after = None, None
-            if (
-                self.cl_ortho_method == "kd_ortho"
-                and self.teacher_model is not None
-                and self.cl_kd_logit_lambda > 0
-                and kd_loss is not None
-            ):
-                # 1) 准备 g_old：优先使用任务级缓存，否则按当前 batch 估计
-                old_grads = None
-                if self.kd_ortho_ref_grads is not None:
-                    old_grads = {
-                        name: g.to(self.device) for name, g in self.kd_ortho_ref_grads.items()
-                    }
-                else:
-                    self.optimizer.zero_grad()
-                    self.net.zero_grad()
-                    kd_loss.backward(retain_graph=True)
-                    old_grads = {}
-                    for name, p in self.net.module.named_parameters():
-                        if p.grad is not None and p.requires_grad:
-                            old_grads[name] = p.grad.detach().clone()
-                    self.optimizer.zero_grad()
-                    self.net.zero_grad()
-
-                # 2) 反向计算当前梯度
-                self.optimizer.zero_grad()
-                self.net.zero_grad()
-                total_loss.backward()
-
-                # 3) 投影到 g_old 的正交子空间
-                eps = 1e-12
-                g_list_before = []
-                g_old_list = []
-                for name, p in self.net.module.named_parameters():
-                    if p.grad is None or name not in old_grads:
-                        continue
-                    g = p.grad
-                    g_old = old_grads[name].to(g.device)
-
-                    g_flat = g.view(-1)
-                    g_old_flat = g_old.view(-1)
-                    denom = torch.dot(g_old_flat, g_old_flat) + eps
-                    if denom.item() == 0.0:
-                        continue
-
-                    dot = torch.dot(g_flat, g_old_flat)
-                    proj_coef = dot / denom
-
-                    g_list_before.append(g_flat.detach().clone())
-                    g_old_list.append(g_old_flat.detach().clone())
-
-                    scale = self.cl_ortho_scale
-                    g_ortho_flat = g_flat - scale * proj_coef * g_old_flat
-                    p.grad.copy_(g_ortho_flat.view_as(p))
-
-                if g_list_before and g_old_list:
-                    g_flat_all = torch.cat(g_list_before)
-                    g_old_all = torch.cat(g_old_list)
-                    cos_before = F.cosine_similarity(
-                        g_flat_all.unsqueeze(0), g_old_all.unsqueeze(0), dim=1
-                    ).item()
-                    g_list_after = []
-                    for name, p in self.net.module.named_parameters():
-                        if p.grad is None or name not in old_grads:
-                            continue
-                        g_list_after.append(p.grad.detach().view(-1))
-                    if g_list_after:
-                        g_flat_after = torch.cat(g_list_after)
-                        cos_after = F.cosine_similarity(
-                            g_flat_after.unsqueeze(0), g_old_all.unsqueeze(0), dim=1
-                        ).item()
-
-            elif self.cl_ortho_method == "prev_grad_ortho":
-                # 使用上一轮梯度做正交投影
-                self.optimizer.zero_grad()
-                self.net.zero_grad()
-                total_loss.backward()
-                cos_before, cos_after = self.apply_ortho_projection_with_previous_gradients(return_cos=True, use_kd=False)
-                # 本轮梯度投影后立即保存，供下一轮使用
-                self.save_gradients()
-
-            elif (
-                self.cl_ortho_method == "kd_prev_grad_ortho"
-                and self.teacher_model is not None
-            ):
-                # 使用上一任务保存的 KD 参考梯度（固定 teacher），不随当前 batch 更新；如果加载失败，则跳过投影
-                self.optimizer.zero_grad()
-                self.net.zero_grad()
-                total_loss.backward()
-                cos_before, cos_after = (None, None)
-                if self.prev_kd_grads is not None:
-                    cos_before, cos_after = self.apply_ortho_projection_with_previous_gradients(
-                        return_cos=True, use_kd=True, use_history=False
-                    )
-                
-            else:
-                # ========== 其他 ortho / 普通模式 ==========
-                self.optimizer.zero_grad()
-                self.net.zero_grad()
-                total_loss.backward()
-                if self.cl_ortho_method != "none":
-                    cos_before, cos_after = self.apply_ortho_projection(return_cos=True)
+            cos_before, cos_after = apply_orthogonal_update(self, total_loss, kd_loss=kd_loss)
 
             # 更新参数
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
             self.optimizer.step()
             
             # 将当前任务样本加入重放缓冲区（仅当前 batch 原样本）
-            if self.replay_mode != "none" and self.replay_capacity > 0:
+            if replay_is_enabled(self):
                 self.replay_buffer.add_batch(cur_x_cpu, cur_y_cpu, self.task_id)
                 
             # RWalk 路径积分累积
@@ -1713,7 +1621,7 @@ class RunManager:
 
             # 打印正交余弦信息（仅当有投影时）
             if (
-                self.cl_ortho_method != "none"
+                orthogonal_update_is_enabled(self)
                 and cos_before is not None
                 and cos_after is not None
                 and (i % 50 == 0)
@@ -1947,7 +1855,7 @@ class RunManager:
                 self.net.module.load_state_dict(server_model.state_dict())
 
         nBatch = len(self.run_config.train_loader)
-        if getattr(self, "replay_only_training", False):
+        if getattr(self, "replay_only_training", False) and replay_is_enabled(self):
             source_buffer = self.stage_training_buffer if self.stage_training_buffer is not None else self.replay_buffer
             buffer_len = len(source_buffer) if source_buffer is not None else 0
             if buffer_len <= 0:
@@ -1998,7 +1906,7 @@ class RunManager:
             "replay_task_hist": {},
         }
         # 记录本轮开始前的回放缓存分布，便于观测旧任务样本是否被保留
-        if self.replay_mode != "none" and self.replay_capacity > 0:
+        if replay_is_enabled(self):
             hist_start = self.replay_buffer.task_hist()
             self.write_log(
                 f"[Replay] task{self.task_id} client{self.run_config.data_provider.client_id} "
@@ -2031,7 +1939,7 @@ class RunManager:
             writer.add_scalar(tb_prefix + "_trn_top1", train_acc_top1.avg, epoch)
             writer.add_scalar(tb_prefix + "_trn_top5", train_acc_top5.avg, epoch)
             writer.add_scalar(tb_prefix + "_trn_loss", train_losses.avg, epoch)
-            if self.ewc_lambda > 0:
+            if ewc_is_enabled(self):
                 writer.add_scalar(tb_prefix + "_ewc_penalty", ewc_meter.avg, epoch)
 
             if epoch % 3 == 0:
@@ -2043,7 +1951,7 @@ class RunManager:
                 writer.add_scalar(tb_prefix + "_val_top5", val_acc5, epoch)
         round_data_stats["epochs"] = max(0, int((n_epochs or 0) - (start_epoch or 0)))
         # 记录本轮结束后的回放缓存分布
-        if self.replay_mode != "none" and self.replay_capacity > 0:
+        if replay_is_enabled(self):
             hist_end = self.replay_buffer.task_hist()
             self.write_log(
                 f"[Replay] task{self.task_id} client{self.run_config.data_provider.client_id} "
@@ -2146,9 +2054,13 @@ class CifarRunConfig(RunConfig):
         cl_kd_logit_lambda: float = 0.0,
         cl_kd_temperature: float = 2.0,
         cl_kd_conf_threshold: float = 0.5,
+        enable_kd: bool = False,
         cl_ortho_method: str = "none",
         cl_ortho_scale: float = 1.0,
         ortho_samples_per_task: int = 2048,
+        enable_replay: bool = False,
+        enable_ewc: bool = False,
+        enable_orthogonal_update: bool = False,
         **kwargs,
     ):
         print(f"CifarRunConfig初始化开始... is_client={is_client} client_id={client_id}")
@@ -2198,11 +2110,15 @@ class CifarRunConfig(RunConfig):
         self.cl_kd_logit_lambda = float(cl_kd_logit_lambda)
         self.cl_kd_temperature = float(cl_kd_temperature)
         self.cl_kd_conf_threshold = float(cl_kd_conf_threshold)
+        self.enable_kd = bool(enable_kd)
         
         # 正交更新相关
         self.cl_ortho_method = str(cl_ortho_method).lower()
         self.cl_ortho_scale = float(cl_ortho_scale)
         self.ortho_samples_per_task = int(ortho_samples_per_task)
+        self.enable_replay = bool(enable_replay)
+        self.enable_ewc = bool(enable_ewc)
+        self.enable_orthogonal_update = bool(enable_orthogonal_update)
 
         # 推导每任务类别数（若未显式给出）
         total_classes = None

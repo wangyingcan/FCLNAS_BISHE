@@ -18,7 +18,7 @@ from tensorboardX import SummaryWriter
 class ClusteringMachine:
     def __init__(self, target_hardware=None, config=None, global_server=None,
                  clients_idx_arr=None, clients=None, start_round=0,
-                 last_round=None, path='./', task_id=1, teacher_model=None):
+                 last_round=None, path='./', task_id=1):
         self.hardware = target_hardware
         self.config = config
         self.global_server = copy.deepcopy(global_server)
@@ -29,7 +29,6 @@ class ClusteringMachine:
         self.local_epoch_number = config.local_epoch_number
         self.path = path
         self.task_id = task_id
-        self.teacher_model = teacher_model
         self._logs_path, self._save_path = None, None
         
         # TensorBoard 日志路径中加入 task_id
@@ -41,36 +40,41 @@ class ClusteringMachine:
                                           comment=f"fed_search_task_{task_id}")
         print('tensorboardX logdir', self.writerTf.logdir)
 
+    def _emit_progress(self, event, **payload):
+        runtime_context = getattr(self.config, "runtime_context", None)
+        callback = getattr(runtime_context, "progress_callback", None)
+        if callable(callback):
+            start = time.time()
+            try:
+                result = callback(event, **payload)
+                if isinstance(result, (int, float)):
+                    return float(result)
+            except Exception as e:
+                print(f"[Progress] search callback failed for {event}: {e}")
+            return max(0.0, time.time() - start)
+        return 0.0
+
     
     def train_clients(self):
         self.start_round = self.global_server.round
         print('len(self.clients_idx_arr): ', len(self.clients_idx_arr))
         best_val_acc = 0
-        kd_lambda = getattr(self.config, "kd_lambda", 0.0)
-        kd_temperature = getattr(self.config, "kd_temperature", 1.0)
-        reg_lambda = getattr(self.config, "reg_lambda", 0.0)
-        reg_use_ewc = getattr(self.config, "reg_use_ewc", False)
-        # baseline 风格的 CL 参数（若未显式配置，保留旧 supernet 超参）
-        cl_kd_method = getattr(self.config, "cl_kd_method", "none")
-        cl_kd_lambda = getattr(self.config, "cl_kd_logit_lambda", 0.0) or kd_lambda
-        cl_kd_temperature = getattr(self.config, "cl_kd_temperature", kd_temperature)
-        cl_kd_conf_threshold = getattr(self.config, "cl_kd_conf_threshold", 0.5)
-        cl_ortho_method = getattr(self.config, "cl_ortho_method", "none")
-        cl_ortho_scale = getattr(self.config, "cl_ortho_scale", 1.0)
-        ortho_samples_per_task = getattr(self.config, "ortho_samples_per_task", 0)
-        cl_penalty_clip = getattr(self.config, "cl_penalty_clip", None)
-        # ewc_lambda 可作为 reg_lambda 的替代开关，方便与 baseline 对齐
-        reg_lambda = reg_lambda if reg_lambda > 0 else getattr(self.config, "ewc_lambda", 0.0)
+        self._emit_progress("search_started")
         for round in range(self.start_round, self.last_round):
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_entropy, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+            round_wall_start = time.time()
+            local_compute_time = 0.0
+            aggregation_time = 0.0
+            evaluation_time = 0.0
+            checkpoint_io_time = 0.0
             start_local_epoch, last_local_epoch = arrange_local_epoch_from_round(global_round=round,
                                                                                  local_epoch_number=self.local_epoch_number)
             clients_params_arr, clients_data_w = [], []
             # 拿当前全局超网权重，作为本轮下发给各客户端的初始模型
             server_model = copy.deepcopy(self.global_server.net)
-            teacher_for_clients = self.teacher_model if self.teacher_model is not None else server_model
             round_time = time.time()
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            local_compute_start = time.time()
             for idx in self.clients_idx_arr:
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, entropy, lr = self.clients[
                     idx].train(
@@ -78,20 +82,6 @@ class ClusteringMachine:
                     start_local_epoch=start_local_epoch,
                     last_local_epoch=last_local_epoch,
                     writer=self.writerTf,
-                    teacher_model=teacher_for_clients,
-                    kd_lambda=kd_lambda,
-                    kd_temperature=kd_temperature,
-                    reg_lambda=reg_lambda,
-                    reg_use_ewc=reg_use_ewc,
-                    cl_kd_method=cl_kd_method,
-                    cl_kd_lambda=cl_kd_lambda,
-                    cl_kd_temperature=cl_kd_temperature,
-                    cl_kd_conf_threshold=cl_kd_conf_threshold,
-                    cl_ortho_method=cl_ortho_method,
-                    cl_ortho_scale=cl_ortho_scale,
-                    ortho_samples_per_task=ortho_samples_per_task,
-                    cl_penalty_clip=cl_penalty_clip,
-                    arch_replay_lambda=getattr(self.config, "arch_replay_lambda", 0.0),
                 )
                 # local_weight 表示该客户端本轮可用的训练样本数，聚合时作为加权系数
                 local_weight = self.clients[idx].get_local_data_weight()
@@ -109,6 +99,7 @@ class ClusteringMachine:
                 clients_val_top5.update(val_top5)
                 clients_entropy.update(entropy)
                 clients_lr.update(lr)
+            local_compute_time += time.time() - local_compute_start
             self.writerTf.add_scalar('clients_trn_loss', clients_trn_loss.avg, round)
             self.writerTf.add_scalar('clients_trn_top1', clients_trn_top1.avg, round)
             self.writerTf.add_scalar('clients_trn_top5', clients_trn_top5.avg, round)
@@ -131,16 +122,19 @@ class ClusteringMachine:
                 continue
             
             # 聚合后直接落到 DataParallel 内部的 module，确保键名一致且不丢失权重
+            aggregation_start = time.time()
             new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
             server_dict = self.global_server.run_manager.net.module.state_dict()
             server_dict.update(new_weight_fedavg)
             self.global_server.run_manager.net.module.load_state_dict(server_dict)
+            aggregation_time += time.time() - aggregation_start
             
             self.global_server.write_log('-' * 30 + 'Current Architecture [%d]' % (round + 1) + '-' * 30, prefix='arch')
             for idx, block in enumerate(self.global_server.net.blocks):
                 self.global_server.write_log('%d. %s' % (idx, block.module_str), prefix='arch')
 
             # Calculate avg training accuracy over all users at every round
+            evaluation_start = time.time()
             self.global_server.net.eval()
             with torch.no_grad():
                 # directly use global_server's centralized data for faster inference
@@ -150,6 +144,7 @@ class ClusteringMachine:
                     is_best = True
                 else:
                     is_best = False
+            evaluation_time += time.time() - evaluation_start
             # save global model and each client's opt.
             checkpoint = {}
             checkpoint['round'] = round
@@ -161,56 +156,76 @@ class ClusteringMachine:
             for id in self.clients_idx_arr:
                 checkpoint[f"task_{self.task_id}_{id}_weight_optimizer"] = self.clients[id].run_manager.optimizer.state_dict()
                 checkpoint[f"task_{self.task_id}_{id}_arch_optimizer"] = self.clients[id].arch_optimizer.state_dict()
+            checkpoint_io_start = time.time()
             self.global_server.run_manager.save_model(checkpoint, is_best=is_best, model_name="global.pth.tar")
+            checkpoint_io_time += time.time() - checkpoint_io_start
+            checkpoint_io_time += self._emit_progress(
+                "search_round_completed",
+                round_idx=round,
+                checkpoint_path=os.path.join(self.global_server.run_manager.save_path, "global.pth.tar"),
+            )
+            wall_clock_time = time.time() - round_wall_start
+            algorithm_time = local_compute_time + aggregation_time + evaluation_time
+            runtime_context = getattr(self.config, "runtime_context", None)
+            if runtime_context is not None:
+                runtime_context.update_timing(
+                    "search",
+                    round_idx=round,
+                    local_compute_time=local_compute_time,
+                    aggregation_time=aggregation_time,
+                    evaluation_time=evaluation_time,
+                    checkpoint_io_time=checkpoint_io_time,
+                    algorithm_time=algorithm_time,
+                    wall_clock_time=wall_clock_time,
+                )
+            self.writerTf.add_scalar('search_local_compute_time_min', local_compute_time / 60, round)
+            self.writerTf.add_scalar('search_aggregation_time_min', aggregation_time / 60, round)
+            self.writerTf.add_scalar('search_evaluation_time_min', evaluation_time / 60, round)
+            self.writerTf.add_scalar('search_checkpoint_io_time_min', checkpoint_io_time / 60, round)
+            self.writerTf.add_scalar('search_algorithm_time_min', algorithm_time / 60, round)
+            self.writerTf.add_scalar('search_wall_clock_time_min', wall_clock_time / 60, round)
+            self.write_log(
+                'search_timing local_compute {:.4f}m, aggregation {:.4f}m, evaluation {:.4f}m, checkpoint_io {:.4f}m, algorithm {:.4f}m, wall {:.4f}m'.format(
+                    local_compute_time / 60,
+                    aggregation_time / 60,
+                    evaluation_time / 60,
+                    checkpoint_io_time / 60,
+                    algorithm_time / 60,
+                    wall_clock_time / 60,
+                ),
+                prefix='search',
+            )
                 
             # self.test_inference()  # 测试集上跑一下
+        self._emit_progress(
+            "search_completed",
+            checkpoint_path=os.path.join(self.global_server.run_manager.save_path, "global.pth.tar"),
+        )
         self.writerTf.close()
 
     
     def warmup_clients(self):
         self.warmup_round = self.global_server.warmup_round
         print('len(self.clients_idx_arr): ', len(self.clients_idx_arr))
-        kd_lambda = getattr(self.config, "kd_lambda", 0.0)
-        kd_temperature = getattr(self.config, "kd_temperature", 1.0)
-        reg_lambda = getattr(self.config, "reg_lambda", 0.0)
-        reg_use_ewc = getattr(self.config, "reg_use_ewc", False)
-        cl_kd_method = getattr(self.config, "cl_kd_method", "none")
-        cl_kd_lambda = getattr(self.config, "cl_kd_logit_lambda", 0.0) or kd_lambda
-        cl_kd_temperature = getattr(self.config, "cl_kd_temperature", kd_temperature)
-        cl_kd_conf_threshold = getattr(self.config, "cl_kd_conf_threshold", 0.5)
-        cl_ortho_method = getattr(self.config, "cl_ortho_method", "none")
-        cl_ortho_scale = getattr(self.config, "cl_ortho_scale", 1.0)
-        ortho_samples_per_task = getattr(self.config, "ortho_samples_per_task", 0)
-        cl_penalty_clip = getattr(self.config, "cl_penalty_clip", None)
-        reg_lambda = reg_lambda if reg_lambda > 0 else getattr(self.config, "ewc_lambda", 0.0)
-
+        self._emit_progress("warmup_started")
         for round in range(self.warmup_round, self.config.warmup_n_rounds):
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+            round_wall_start = time.time()
+            local_compute_time = 0.0
+            aggregation_time = 0.0
+            checkpoint_io_time = 0.0
             start_local_epoch, last_local_epoch = arrange_local_epoch_from_round(global_round=round,
                                                                                  local_epoch_number=self.local_epoch_number)
             clients_params_arr, clients_data_w = [], []
             server_model = copy.deepcopy(self.global_server.net)
-            teacher_for_clients = self.teacher_model if self.teacher_model is not None else server_model
             round_time = time.time()
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            local_compute_start = time.time()
             for idx in self.clients_idx_arr:
                 # 预热阶段客户端的训练：随机子网前后向，只更新权重，不更新架构参数
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = self.clients[
                     idx].warm_up(server_model=server_model, start_local_epoch=start_local_epoch,
-                                 last_local_epoch=last_local_epoch, writer=self.writerTf,
-                                 teacher_model=teacher_for_clients,
-                                 kd_lambda=kd_lambda,
-                                 kd_temperature=kd_temperature,
-                                 reg_lambda=reg_lambda,
-                                 reg_use_ewc=reg_use_ewc,
-                                 cl_kd_method=cl_kd_method,
-                                 cl_kd_lambda=cl_kd_lambda,
-                                 cl_kd_temperature=cl_kd_temperature,
-                                 cl_kd_conf_threshold=cl_kd_conf_threshold,
-                                 cl_ortho_method=cl_ortho_method,
-                                 cl_ortho_scale=cl_ortho_scale,
-                                 ortho_samples_per_task=ortho_samples_per_task,
-                                 cl_penalty_clip=cl_penalty_clip)
+                                 last_local_epoch=last_local_epoch, writer=self.writerTf)
                 local_weight = self.clients[idx].get_local_data_weight()
                 if local_weight <= 0:
                     self.write_log(f"skip client {idx} in warmup round {round} because local data weight is 0", prefix='warmup')
@@ -224,6 +239,7 @@ class ClusteringMachine:
                 clients_val_top1.update(val_top1)
                 clients_val_top5.update(val_top5)
                 clients_lr.update(lr)
+            local_compute_time += time.time() - local_compute_start
             self.writerTf.add_scalar('warmup clients_trn_loss', clients_trn_loss.avg, round)
             self.writerTf.add_scalar('warmup clients_trn_top1', clients_trn_top1.avg, round)
             self.writerTf.add_scalar('warmup clients_trn_top5', clients_trn_top5.avg, round)
@@ -239,10 +255,12 @@ class ClusteringMachine:
                 continue
             
             # 同样使用 DataParallel 内部 module 的 state_dict 保持键名一致
+            aggregation_start = time.time()
             new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
             server_dict = self.global_server.run_manager.net.module.state_dict()
             server_dict.update(new_weight_fedavg)
             self.global_server.run_manager.net.module.load_state_dict(server_dict)
+            aggregation_time += time.time() - aggregation_start
             
             # 保存聚合后的超网权重 + 各优化器状态，便于断点续训/跨任务继承
             checkpoint = {}
@@ -254,7 +272,43 @@ class ClusteringMachine:
             for id in self.clients_idx_arr:
                 checkpoint[f"task_{self.task_id}_{id}_weight_optimizer"] = self.clients[id].run_manager.optimizer.state_dict()
                 checkpoint[f"task_{self.task_id}_{id}_arch_optimizer"] = self.clients[id].arch_optimizer.state_dict()
+            checkpoint_io_start = time.time()
             self.global_server.run_manager.save_model(checkpoint, model_name="warmup.pth.tar")
+            checkpoint_io_time += time.time() - checkpoint_io_start
+            checkpoint_io_time += self._emit_progress(
+                "warmup_round_completed",
+                round_idx=round,
+                checkpoint_path=os.path.join(self.global_server.run_manager.save_path, "warmup.pth.tar"),
+            )
+            wall_clock_time = time.time() - round_wall_start
+            algorithm_time = local_compute_time + aggregation_time
+            runtime_context = getattr(self.config, "runtime_context", None)
+            if runtime_context is not None:
+                runtime_context.update_timing(
+                    "warmup",
+                    round_idx=round,
+                    local_compute_time=local_compute_time,
+                    aggregation_time=aggregation_time,
+                    evaluation_time=0.0,
+                    checkpoint_io_time=checkpoint_io_time,
+                    algorithm_time=algorithm_time,
+                    wall_clock_time=wall_clock_time,
+                )
+            self.writerTf.add_scalar('warmup_local_compute_time_min', local_compute_time / 60, round)
+            self.writerTf.add_scalar('warmup_aggregation_time_min', aggregation_time / 60, round)
+            self.writerTf.add_scalar('warmup_checkpoint_io_time_min', checkpoint_io_time / 60, round)
+            self.writerTf.add_scalar('warmup_algorithm_time_min', algorithm_time / 60, round)
+            self.writerTf.add_scalar('warmup_wall_clock_time_min', wall_clock_time / 60, round)
+            self.write_log(
+                'warmup_timing local_compute {:.4f}m, aggregation {:.4f}m, checkpoint_io {:.4f}m, algorithm {:.4f}m, wall {:.4f}m'.format(
+                    local_compute_time / 60,
+                    aggregation_time / 60,
+                    checkpoint_io_time / 60,
+                    algorithm_time / 60,
+                    wall_clock_time / 60,
+                ),
+                prefix='warmup',
+            )
             
         checkpoint = {}
         checkpoint['warmup_round'] = self.config.warmup_n_rounds
@@ -263,7 +317,17 @@ class ClusteringMachine:
         for id in self.clients_idx_arr:
             checkpoint[f"task_{self.task_id}_{id}_weight_optimizer"] = self.clients[id].run_manager.optimizer.state_dict()
             checkpoint[f"task_{self.task_id}_{id}_arch_optimizer"] = self.clients[id].arch_optimizer.state_dict()
+        checkpoint_io_start = time.time()
         self.global_server.run_manager.save_model(checkpoint, model_name=f"warmup.pth.tar")
+        checkpoint_io_time = time.time() - checkpoint_io_start
+        checkpoint_io_time += self._emit_progress(
+            "warmup_completed",
+            checkpoint_path=os.path.join(self.global_server.run_manager.save_path, "warmup.pth.tar"),
+        )
+        self.write_log(
+            'warmup_finalize_checkpoint_io {:.4f}m'.format(checkpoint_io_time / 60),
+            prefix='warmup',
+        )
         self.writerTf.close()
 
     
@@ -311,7 +375,10 @@ class ClusteringMachine:
                 print('Exception about load clients opt:', e)
                 
         # 先warmup，再train
-        if not getattr(self.config, "skip_warmup", False):
+        skip_warmup = bool(getattr(self.config, "skip_warmup", False))
+        if getattr(self.config, "resume", False) and not getattr(self.global_server, "warmup", False):
+            skip_warmup = True
+        if not skip_warmup:
             self.warmup_clients()
         self.train_clients()
 

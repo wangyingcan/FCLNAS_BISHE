@@ -45,6 +45,20 @@ class CommonwealthMachine:
                     except Exception:
                         pass
 
+    def _emit_progress(self, event, **payload):
+        runtime_context = getattr(self.config, "runtime_context", None)
+        callback = getattr(runtime_context, "progress_callback", None)
+        if callable(callback):
+            start = time.time()
+            try:
+                result = callback(event, **payload)
+                if isinstance(result, (int, float)):
+                    return float(result)
+            except Exception as e:
+                print(f"[Progress] retrain callback failed for {event}: {e}")
+            return max(0.0, time.time() - start)
+        return 0.0
+
     
     def run(self):
         print('self.config.resume: ', self.config.resume)
@@ -68,12 +82,18 @@ class CommonwealthMachine:
         for round in range(self.start_round, self.last_round):
             print('round', round+1)
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
+            round_wall_start = time.time()
+            local_compute_time = 0.0
+            aggregation_time = 0.0
+            evaluation_time = 0.0
+            checkpoint_io_time = 0.0
             clients_params_arr, clients_data_w = [], []
             round_time = time.time()
             server_model = copy.deepcopy(self.global_run_manager.net.module)
             start_local_epoch, last_local_epoch = arrange_local_epoch_from_round(global_round=round,
                                                                                  local_epoch_number=self.local_epoch_number)
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            local_compute_start = time.time()
             for idx in self.clients_idx_arr:
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = self.clients[idx].train_run_manager(
                     start_local_epoch=start_local_epoch,
@@ -90,6 +110,7 @@ class CommonwealthMachine:
                 clients_val_top1.update(val_top1)
                 clients_val_top5.update(val_top5)
                 clients_lr.update(lr)
+            local_compute_time += time.time() - local_compute_start
             self.writerTf.add_scalar('clients_trn_loss', clients_trn_loss.avg, round)
             self.writerTf.add_scalar('clients_trn_top1', clients_trn_top1.avg, round)
             self.writerTf.add_scalar('clients_trn_top5', clients_trn_top5.avg, round)
@@ -108,10 +129,12 @@ class CommonwealthMachine:
                 prefix='retrain')
 
             # 联邦聚合
+            aggregation_start = time.time()
             new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
             server_dict = self.global_run_manager.net.module.state_dict()
             server_dict.update(new_weight_fedavg)
             missing, unexpected = self.global_run_manager.net.module.load_state_dict(server_dict, strict=False)
+            aggregation_time += time.time() - aggregation_start
             
             # 记录多余的或缺失的键
             if missing or unexpected:
@@ -122,6 +145,7 @@ class CommonwealthMachine:
                 )
 
             # 在验证集上跑一下 + 保存最优模型
+            evaluation_start = time.time()
             self.global_run_manager.net.module.eval()
             with torch.no_grad():
                 val_loss, val_acc_top1, val_acc_top5 = self.global_run_manager.validate(is_test=False, return_top5=True)
@@ -137,16 +161,26 @@ class CommonwealthMachine:
                 for id in self.clients_idx_arr:
                     checkpoint[str(id) + '_weight_optimizer'] = self.clients[
                         id].optimizer.state_dict()
+                checkpoint_io_start = time.time()
                 self.global_run_manager.save_model(checkpoint, is_best=is_best)
+                checkpoint_io_time += time.time() - checkpoint_io_start
+                checkpoint_io_time += self._emit_progress(
+                    "retrain_round_completed",
+                    round_idx=round,
+                    checkpoint_path=os.path.join(self.global_run_manager.save_path, "checkpoint.pth.tar"),
+                )
                 
                 self.writerTf.add_scalar('global_test_loss', val_loss, round)
                 self.writerTf.add_scalar('global_test_top1', val_acc_top1, round)
                 self.writerTf.add_scalar('global_test_top5', val_acc_top5, round)
+            evaluation_time += time.time() - evaluation_start
                     
             # 在测试集上跑一下 + 正则化
             self.test_inference(tag="learned_net")
             # 在线累积 EWC：按设定轮次或最后一轮计算 Fisher
             if (
+                getattr(self.config, "enable_ewc", False)
+                and
                 getattr(self.config, "ewc_lambda", 0) > 0
                 and getattr(self.config, "ewc_online_interval", 0) > 0
                 and (
@@ -177,6 +211,37 @@ class CommonwealthMachine:
                         prefix="retrain",
                         should_print=True,
                     )
+            wall_clock_time = time.time() - round_wall_start
+            algorithm_time = local_compute_time + aggregation_time + evaluation_time
+            runtime_context = getattr(self.config, "runtime_context", None)
+            if runtime_context is not None:
+                runtime_context.update_timing(
+                    "retrain",
+                    round_idx=round,
+                    local_compute_time=local_compute_time,
+                    aggregation_time=aggregation_time,
+                    evaluation_time=evaluation_time,
+                    checkpoint_io_time=checkpoint_io_time,
+                    algorithm_time=algorithm_time,
+                    wall_clock_time=wall_clock_time,
+                )
+            self.writerTf.add_scalar('retrain_local_compute_time_min', local_compute_time / 60, round)
+            self.writerTf.add_scalar('retrain_aggregation_time_min', aggregation_time / 60, round)
+            self.writerTf.add_scalar('retrain_evaluation_time_min', evaluation_time / 60, round)
+            self.writerTf.add_scalar('retrain_checkpoint_io_time_min', checkpoint_io_time / 60, round)
+            self.writerTf.add_scalar('retrain_algorithm_time_min', algorithm_time / 60, round)
+            self.writerTf.add_scalar('retrain_wall_clock_time_min', wall_clock_time / 60, round)
+            self.write_log(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] " +
+                ' retrain_timing local_compute {:.4f}m, aggregation {:.4f}m, evaluation {:.4f}m, checkpoint_io {:.4f}m, algorithm {:.4f}m, wall {:.4f}m'.format(
+                    local_compute_time / 60,
+                    aggregation_time / 60,
+                    evaluation_time / 60,
+                    checkpoint_io_time / 60,
+                    algorithm_time / 60,
+                    wall_clock_time / 60,
+                ),
+                prefix='retrain')
         self.writerTf.close()
 
     

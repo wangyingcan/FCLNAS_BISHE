@@ -2001,6 +2001,12 @@ class RunManager:
             if hist_str:
                 log_parts.append(" ".join(hist_str))
             self.write_log(" ".join(log_parts), prefix="train", should_print=True)
+
+        if val_loss is None or val_acc is None or val_acc5 is None:
+            # 当前联邦轮可能没有命中 epoch % 3 == 0 的验证条件。
+            # 为了让上层联邦聚合日志始终拿到稳定数值，这里在返回前补做一次验证。
+            val_loss, val_acc, val_acc5 = self.validate(is_test=False, return_top5=True)
+
         lr_value = lr.avg if isinstance(lr, AverageMeter) else lr
         return (
             train_losses_arr.avg,

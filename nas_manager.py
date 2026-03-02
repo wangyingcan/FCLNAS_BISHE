@@ -726,6 +726,12 @@ class ArchSearchRunManager:
                 writer.add_scalar(tb_prefix + "_val_loss", val_loss, epoch)
                 writer.add_scalar(tb_prefix + "_val_top1", val_top1, epoch)
                 writer.add_scalar(tb_prefix + "_val_top5", val_top5, epoch)
+
+        if val_loss is None or val_top1 is None or val_top5 is None:
+            # 当 local_epoch_number < validation_frequency 时，这一轮可能从未进入验证分支。
+            # 为了保证联邦端聚合日志拿到稳定数值，这里在返回前补做一次验证。
+            (val_loss, val_top1, val_top5), flops, latency = self.validate()
+
         return (
             trn_loss,
             trn_top1,

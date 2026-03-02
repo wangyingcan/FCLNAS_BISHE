@@ -1,6 +1,7 @@
 import pickle
 import time
 import warnings
+import json
 
 import numpy as np
 import torch
@@ -44,6 +45,21 @@ class CommonwealthMachine:
                         os.remove(fpath)
                     except Exception:
                         pass
+
+    def _append_per_client_metric(self, round_idx, client_id, **metrics):
+        record = {
+            "phase": "retrain",
+            "round": int(round_idx),
+            "client_id": int(client_id),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        task_id = getattr(getattr(self.global_run_manager, "run_config", None), "task_id", None)
+        if task_id is not None:
+            record["task_id"] = int(task_id)
+        record.update(metrics)
+        metrics_path = os.path.join(self.logs_path, "per_client_metrics.jsonl")
+        with open(metrics_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, ensure_ascii=True) + "\n")
 
     def _emit_progress(self, event, **payload):
         runtime_context = getattr(self.config, "runtime_context", None)
@@ -103,6 +119,38 @@ class CommonwealthMachine:
                     global_round_idx=round + 1)
                 clients_params_arr.append(copy.deepcopy(self.clients[idx].return_model_dict()))
                 clients_data_w.append(self.clients[idx].get_local_data_weight())
+                client_round_prefix = f"task_{self.clients[idx].task_id}_client_{idx}_round"
+                self.writerTf.add_scalar(client_round_prefix + "_trn_loss", trn_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_trn_top1", trn_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_trn_top5", trn_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_val_loss", val_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_val_top1", val_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_val_top5", val_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_lr", lr, round)
+                self.write_log(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    + " retrain client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, lr {:.4f}".format(
+                        idx,
+                        round + 1,
+                        trn_loss,
+                        trn_top1,
+                        val_loss,
+                        val_top1,
+                        lr,
+                    ),
+                    prefix="retrain",
+                )
+                self._append_per_client_metric(
+                    round,
+                    idx,
+                    trn_loss=trn_loss,
+                    trn_top1=trn_top1,
+                    trn_top5=trn_top5,
+                    val_loss=val_loss,
+                    val_top1=val_top1,
+                    val_top5=val_top5,
+                    lr=lr,
+                )
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)

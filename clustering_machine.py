@@ -1,6 +1,7 @@
 import pickle
 import time
 import warnings
+import json
 
 import numpy as np
 import torch
@@ -39,6 +40,19 @@ class ClusteringMachine:
             self.writerTf = SummaryWriter(logdir=os.path.join(self.path, 'tensorboard'), 
                                           comment=f"fed_search_task_{task_id}")
         print('tensorboardX logdir', self.writerTf.logdir)
+
+    def _append_per_client_metric(self, phase, round_idx, client_id, **metrics):
+        record = {
+            "phase": phase,
+            "task_id": int(self.task_id),
+            "round": int(round_idx),
+            "client_id": int(client_id),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        record.update(metrics)
+        metrics_path = os.path.join(self.logs_path, "per_client_metrics.jsonl")
+        with open(metrics_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, ensure_ascii=True) + "\n")
 
     def _emit_progress(self, event, **payload):
         runtime_context = getattr(self.config, "runtime_context", None)
@@ -91,6 +105,42 @@ class ClusteringMachine:
                     continue
                 clients_params_arr.append(copy.deepcopy(self.clients[idx].run_manager.return_model_dict()))
                 clients_data_w.append(local_weight)
+                client_round_prefix = f"task_{self.task_id}_client_{idx}_round"
+                self.writerTf.add_scalar(client_round_prefix + "_search_trn_loss", trn_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_trn_top1", trn_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_trn_top5", trn_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_val_loss", val_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_val_top1", val_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_val_top5", val_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_entropy", entropy, round)
+                self.writerTf.add_scalar(client_round_prefix + "_search_lr", lr, round)
+                self.write_log(
+                    "[{}] search client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, entropy {:.4f}, lr {:.4f}".format(
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        idx,
+                        round + 1,
+                        trn_loss,
+                        trn_top1,
+                        val_loss,
+                        val_top1,
+                        entropy,
+                        lr,
+                    ),
+                    prefix='search',
+                )
+                self._append_per_client_metric(
+                    "search",
+                    round,
+                    idx,
+                    trn_loss=trn_loss,
+                    trn_top1=trn_top1,
+                    trn_top5=trn_top5,
+                    val_loss=val_loss,
+                    val_top1=val_top1,
+                    val_top5=val_top5,
+                    entropy=entropy,
+                    lr=lr,
+                )
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)
@@ -232,6 +282,39 @@ class ClusteringMachine:
                     continue
                 clients_params_arr.append(copy.deepcopy(self.clients[idx].run_manager.return_model_dict()))
                 clients_data_w.append(local_weight)
+                client_round_prefix = f"task_{self.task_id}_client_{idx}_round"
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_trn_loss", trn_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_trn_top1", trn_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_trn_top5", trn_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_val_loss", val_loss, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_val_top1", val_top1, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_val_top5", val_top5, round)
+                self.writerTf.add_scalar(client_round_prefix + "_warmup_lr", lr, round)
+                self.write_log(
+                    "[{}] warmup client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, lr {:.4f}".format(
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        idx,
+                        round + 1,
+                        trn_loss,
+                        trn_top1,
+                        val_loss,
+                        val_top1,
+                        lr,
+                    ),
+                    prefix='warmup',
+                )
+                self._append_per_client_metric(
+                    "warmup",
+                    round,
+                    idx,
+                    trn_loss=trn_loss,
+                    trn_top1=trn_top1,
+                    trn_top5=trn_top5,
+                    val_loss=val_loss,
+                    val_top1=val_top1,
+                    val_top5=val_top5,
+                    lr=lr,
+                )
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)

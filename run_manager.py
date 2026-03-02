@@ -1264,6 +1264,17 @@ class RunManager:
             with open(os.path.join(self.logs_path, log_file), "a") as fout:
                 fout.write(log_str + "\n")
                 fout.flush()
+            if bool(getattr(self.run_config, "is_client", False)):
+                client_id = getattr(
+                    self.run_config,
+                    "client_id",
+                    getattr(getattr(self.run_config, "data_provider", None), "client_id", None),
+                )
+                if client_id is not None:
+                    client_log_file = f"client_{client_id}_{log_file}"
+                    with open(os.path.join(self.logs_path, client_log_file), "a") as fout:
+                        fout.write(log_str + "\n")
+                        fout.flush()
         if should_print:
             print(log_str)
 

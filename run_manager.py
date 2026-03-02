@@ -436,7 +436,8 @@ class RunManager:
         # move network to GPU if available
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
-            self.net = torch.nn.DataParallel(self.net)
+            # DataParallel 本身不会把底层参数迁移到 GPU，必须显式 to(device)
+            self.net = torch.nn.DataParallel(self.net).to(self.device)
             cudnn.benchmark = True
         else:
             print("can not use GPU!")

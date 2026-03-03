@@ -4,6 +4,7 @@
 import logging
 import os
 import torch.nn.functional as F
+from arch_prior import compute_arch_prior_penalty
 from run_manager import *
 
 
@@ -258,6 +259,8 @@ class ArchSearchRunManager:
         self.local_valid_top1 = AverageMeter()
         self.local_train_top1 = AverageMeter()
         self.entropy = AverageMeter()
+        self.arch_prior_penalty = AverageMeter()
+        self.arch_prior_penalty_last = 0.0
 
     @property
     def net(self):
@@ -637,7 +640,14 @@ class ArchSearchRunManager:
 
         arch_param_num = len(list(self.net.architecture_parameters()))
         self.entropy = AverageMeter()
+        self.arch_prior_penalty = AverageMeter()
         update_schedule = self.arch_search_config.get_update_schedule(nBatch)
+        if bool(getattr(self, "arch_prior_regularization_enabled", False)) and isinstance(self.arch_search_config, RLArchSearchConfig):
+            self.write_log(
+                "[ArchPriorLoss] enabled but current arch_algo is RL; prior deviation loss is ignored in RL updates",
+                prefix="search",
+                should_logging_info=False,
+            )
         trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, arch_entropy = (
             None,
             None,
@@ -730,6 +740,7 @@ class ArchSearchRunManager:
             writer.add_scalar(tb_prefix + "_train_loss", losses.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top1", top1.avg, epoch)
             writer.add_scalar(tb_prefix + "_train_top5", top5.avg, epoch)
+            writer.add_scalar(tb_prefix + "_arch_prior_penalty", self.arch_prior_penalty.avg, epoch)
             # validate
             if (epoch + 1) % self.run_manager.run_config.validation_frequency == 0:
                 (val_loss, val_top1, val_top5), flops, latency = self.validate()
@@ -884,6 +895,17 @@ class ArchSearchRunManager:
         else:
             raise NotImplementedError
         loss = self.arch_search_config.add_regularization_loss(ce_loss, expected_value)
+        prior_penalty_value = 0.0
+        if bool(getattr(self, "arch_prior_regularization_enabled", False)):
+            target_arch_params = getattr(self, "arch_prior_regularization_target", None)
+            lambda_value = float(getattr(self, "arch_prior_regularization_lambda", 0.0))
+            if lambda_value > 0 and target_arch_params:
+                prior_penalty = compute_arch_prior_penalty(self.net, target_arch_params)
+                if prior_penalty is not None:
+                    loss = loss + lambda_value * prior_penalty
+                    prior_penalty_value = float(prior_penalty.detach().item())
+        self.arch_prior_penalty.update(prior_penalty_value, 1)
+        self.arch_prior_penalty_last = prior_penalty_value
         # compute gradient and do SGD step
         self.run_manager.net.zero_grad()  # zero grads of weight_param, arch_param & binary_param
         loss.backward()

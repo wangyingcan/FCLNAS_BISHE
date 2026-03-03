@@ -101,6 +101,13 @@ class ClusteringMachine:
                         prior_state["applied"] = apply_stats is not None
                         prior_state["apply_stats"] = apply_stats
                         self.clients[idx].preserve_local_arch_params_for_first_sync = bool(apply_stats is not None)
+                        self.clients[idx].arch_prior_regularization_target = prior_state.get("fused_arch_params")
+                        self.clients[idx].arch_prior_regularization_enabled = bool(
+                            getattr(self.config, "enable_arch_prior_loss", False) and apply_stats is not None
+                        )
+                        self.clients[idx].arch_prior_regularization_lambda = float(
+                            getattr(self.config, "arch_prior_loss_lambda", 0.0)
+                        )
                         if bool(getattr(self.config, "log_arch_prior_details", True)):
                             append_arch_prior_log(
                                 os.path.join(self.logs_path, "arch_prior_details.jsonl"),
@@ -113,6 +120,8 @@ class ClusteringMachine:
                                     "weights": prior_state.get("weights").tolist()
                                     if prior_state.get("weights") is not None
                                     else None,
+                                    "enable_arch_prior_loss": bool(getattr(self.config, "enable_arch_prior_loss", False)),
+                                    "arch_prior_loss_lambda": float(getattr(self.config, "arch_prior_loss_lambda", 0.0)),
                                     **(apply_stats or {}),
                                 },
                             )
@@ -155,9 +164,14 @@ class ClusteringMachine:
                 self.writerTf.add_scalar(client_round_prefix + "_search_val_top1", val_top1, round)
                 self.writerTf.add_scalar(client_round_prefix + "_search_val_top5", val_top5, round)
                 self.writerTf.add_scalar(client_round_prefix + "_search_entropy", entropy, round)
+                self.writerTf.add_scalar(
+                    client_round_prefix + "_search_arch_prior_penalty",
+                    float(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0)),
+                    round,
+                )
                 self.writerTf.add_scalar(client_round_prefix + "_search_lr", lr, round)
                 self.write_log(
-                    "[{}] search client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, entropy {:.4f}, lr {:.4f}".format(
+                    "[{}] search client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, entropy {:.4f}, arch_prior_penalty {:.6f}, lr {:.4f}".format(
                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                         idx,
                         round + 1,
@@ -166,6 +180,7 @@ class ClusteringMachine:
                         val_loss,
                         val_top1,
                         entropy,
+                        float(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0)),
                         lr,
                     ),
                     prefix='search',
@@ -181,6 +196,7 @@ class ClusteringMachine:
                     val_top1=val_top1,
                     val_top5=val_top5,
                     entropy=entropy,
+                    arch_prior_penalty=float(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0)),
                     lr=lr,
                 )
                 clients_trn_loss.update(trn_loss)
@@ -199,11 +215,22 @@ class ClusteringMachine:
             self.writerTf.add_scalar('clients_val_top1', clients_val_top1.avg, round)
             self.writerTf.add_scalar('clients_val_top5', clients_val_top5.avg, round)
             self.writerTf.add_scalar('clients_entropy', clients_entropy.avg, round)
+            self.writerTf.add_scalar(
+                'clients_arch_prior_penalty',
+                float(sum(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0) for idx in self.clients_idx_arr) / max(len(self.clients_idx_arr), 1)),
+                round,
+            )
             self.writerTf.add_scalar('clients_lr', clients_lr.avg, round)
             self.write_log(
-                'search clients_trn_loss {:.4f}, clients_trn_top1 {:.4f}, clients_val_loss {:.4f}, clients_val_top1 {:.4f}, clients_entropy {:.4f}, clients_lr {:.4f}'.format(
-                    clients_trn_loss.avg, clients_trn_top1.avg, clients_val_loss.avg, clients_val_top1.avg, clients_entropy.avg,
-                    clients_lr.avg),
+                'search clients_trn_loss {:.4f}, clients_trn_top1 {:.4f}, clients_val_loss {:.4f}, clients_val_top1 {:.4f}, clients_entropy {:.4f}, clients_arch_prior_penalty {:.6f}, clients_lr {:.4f}'.format(
+                    clients_trn_loss.avg,
+                    clients_trn_top1.avg,
+                    clients_val_loss.avg,
+                    clients_val_top1.avg,
+                    clients_entropy.avg,
+                    float(sum(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0) for idx in self.clients_idx_arr) / max(len(self.clients_idx_arr), 1)),
+                    clients_lr.avg,
+                ),
                 prefix='search')
             round_time_use = (time.time() - round_time) / 60
             self.writerTf.add_scalar('round_time_use', round_time_use, round)

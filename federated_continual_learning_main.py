@@ -296,6 +296,9 @@ def run_nas_search_for_task(
             history = client_histories[idx]
             client = clients[idx]
             client.arch_prior_state = None
+            client.arch_prior_regularization_target = None
+            client.arch_prior_regularization_enabled = False
+            client.arch_prior_regularization_lambda = 0.0
 
             previous_subnet = None
             prev_client_artifact = history.subnet_artifacts.get(task_id - 1) if history is not None else None
@@ -369,6 +372,8 @@ def run_nas_search_for_task(
                         "similarity_scores": {int(k): float(v) for k, v in similarity_scores.items()},
                         "topk": int(getattr(args, "arch_prior_topk", 3)),
                         "tau": float(getattr(args, "arch_prior_tau", 1.0)),
+                        "enable_arch_prior_loss": bool(getattr(args, "enable_arch_prior_loss", False)),
+                        "arch_prior_loss_lambda": float(getattr(args, "arch_prior_loss_lambda", 0.0)),
                         "alpha_before_stats": summarize_arch_parameters(clone_arch_parameters(client.net)),
                         **proto_stats,
                     },
@@ -507,6 +512,10 @@ def parse_args() -> argparse.Namespace:
                         help="历史先验 Top-K 任务数")
     parser.add_argument("--arch_prior_tau", type=float, default=0.5,
                         help="历史先验 softmax 温度参数")
+    parser.add_argument("--enable_arch_prior_loss", action="store_true",
+                        help="是否在搜索阶段的架构参数更新中加入与历史先验偏移的正则项，默认关闭")
+    parser.add_argument("--arch_prior_loss_lambda", type=float, default=0.0,
+                        help="历史先验偏移正则强度，仅对 gradient-based NAS 生效")
     parser.add_argument("--log_arch_prior_details", type=parse_optional_bool, default=True,
                         help="是否记录历史先验的详细中间变量和统计量")
     

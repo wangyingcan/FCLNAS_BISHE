@@ -246,6 +246,27 @@ def apply_fused_arch_parameters(current_model, fused_arch_params: ArchParamType)
     }
 
 
+def compute_arch_prior_penalty(current_model, target_arch_params: ArchParamType):
+    if not target_arch_params:
+        return None
+    base_model = unwrap_model(current_model)
+    current_params = list(base_model.architecture_parameters()) if hasattr(base_model, "architecture_parameters") else []
+    if not current_params or len(current_params) != len(target_arch_params):
+        return None
+
+    penalty = None
+    total_elements = 0
+    for current_param, target_param in zip(current_params, target_arch_params):
+        target = target_param.to(device=current_param.device, dtype=current_param.dtype)
+        delta = current_param - target
+        squared_error = delta.pow(2).sum()
+        penalty = squared_error if penalty is None else penalty + squared_error
+        total_elements += int(delta.numel())
+    if penalty is None or total_elements <= 0:
+        return None
+    return penalty / float(total_elements)
+
+
 def save_client_histories(histories: List[ClientHistory], save_path: str):
     states = [history.export_state() for history in histories]
     atomic_torch_save(states, save_path)

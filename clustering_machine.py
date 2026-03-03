@@ -5,6 +5,7 @@ import json
 
 import numpy as np
 import torch
+from arch_prior import apply_fused_arch_parameters, append_arch_prior_log
 from utils_old import save_checkpoint
 
 from nas_manager import ArchSearchRunManager
@@ -90,13 +91,54 @@ class ClusteringMachine:
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
             local_compute_start = time.time()
             for idx in self.clients_idx_arr:
+                if round == self.start_round:
+                    prior_state = getattr(self.clients[idx], "arch_prior_state", None)
+                    if prior_state is not None and not bool(prior_state.get("applied", False)):
+                        apply_stats = apply_fused_arch_parameters(
+                            self.clients[idx].net,
+                            prior_state.get("fused_arch_params"),
+                        )
+                        prior_state["applied"] = apply_stats is not None
+                        prior_state["apply_stats"] = apply_stats
+                        self.clients[idx].preserve_local_arch_params_for_first_sync = bool(apply_stats is not None)
+                        if bool(getattr(self.config, "log_arch_prior_details", True)):
+                            append_arch_prior_log(
+                                os.path.join(self.logs_path, "arch_prior_details.jsonl"),
+                                {
+                                    "event": "prior_applied",
+                                    "task_id": int(self.task_id),
+                                    "client_id": int(idx),
+                                    "round": int(round),
+                                    "selected_task_ids": prior_state.get("selected_task_ids", []),
+                                    "weights": prior_state.get("weights").tolist()
+                                    if prior_state.get("weights") is not None
+                                    else None,
+                                    **(apply_stats or {}),
+                                },
+                            )
+                        if apply_stats is not None:
+                            self.write_log(
+                                "arch_prior client{} round{} selected={} alpha_diff_norm {:.6f}".format(
+                                    idx,
+                                    round + 1,
+                                    prior_state.get("selected_task_ids", []),
+                                    apply_stats.get("alpha_diff_norm", 0.0),
+                                ),
+                                prefix="search",
+                            )
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, entropy, lr = self.clients[
                     idx].train(
                     server_model=server_model,
                     start_local_epoch=start_local_epoch,
                     last_local_epoch=last_local_epoch,
                     writer=self.writerTf,
+                    preserve_local_arch_params=(
+                        round == self.start_round
+                        and bool(getattr(self.clients[idx], "preserve_local_arch_params_for_first_sync", False))
+                    ),
                 )
+                if round == self.start_round:
+                    self.clients[idx].preserve_local_arch_params_for_first_sync = False
                 # local_weight 表示该客户端本轮可用的训练样本数，聚合时作为加权系数
                 local_weight = self.clients[idx].get_local_data_weight()
                 if local_weight <= 0:

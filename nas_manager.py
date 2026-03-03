@@ -598,6 +598,7 @@ class ArchSearchRunManager:
         start_local_epoch=0,
         last_local_epoch=10,
         writer=None,
+        preserve_local_arch_params=False,
     ):
         """
         干净的 ProxylessNAS 搜索阶段。
@@ -607,11 +608,25 @@ class ArchSearchRunManager:
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
                 net_dict = self.net.state_dict()
-                net_dict.update(server_model.module.state_dict())
+                server_state = server_model.module.state_dict()
+                if preserve_local_arch_params:
+                    server_state = {
+                        key: value
+                        for key, value in server_state.items()
+                        if "AP_path_alpha" not in key and "AP_path_wb" not in key
+                    }
+                net_dict.update(server_state)
                 self.net.load_state_dict(net_dict)
             else:
                 net_dict = self.net.state_dict()
-                net_dict.update(server_model.state_dict())
+                server_state = server_model.state_dict()
+                if preserve_local_arch_params:
+                    server_state = {
+                        key: value
+                        for key, value in server_state.items()
+                        if "AP_path_alpha" not in key and "AP_path_wb" not in key
+                    }
+                net_dict.update(server_state)
                 self.net.load_state_dict(net_dict)
 
         data_loader = self.run_manager.run_config.train_loader

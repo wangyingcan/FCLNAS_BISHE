@@ -19,6 +19,20 @@ import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy("file_system")  # 与原逻辑一致
 
 from auto_resume import AutoResumeManager, atomic_torch_save
+from arch_prior import (
+    ClientHistory,
+    append_arch_prior_log,
+    build_arch_prior_weights,
+    build_fused_arch_parameters,
+    clone_arch_parameters,
+    compute_similarity_scores,
+    compute_task_prototype,
+    export_supernet_client_subnet,
+    load_client_histories,
+    load_subnet_from_artifact,
+    save_client_histories,
+    summarize_arch_parameters,
+)
 from clustering_machine import *
 from data_providers.cifar100_fcl_dirichlet_split import CifarDataProvider100
 from nas_manager import ArchSearchRunManager, GradientArchSearchConfig, RLArchSearchConfig
@@ -255,9 +269,111 @@ def quick_evaluate_previous_subnet(previous_subnet, run_config, max_batches: int
     }
 
 
-def run_nas_search_for_task(args, task_id, global_server, clients, client_indices):
+def run_nas_search_for_task(
+    args,
+    task_id,
+    global_server,
+    clients,
+    client_indices,
+    prev_task_path=None,
+    current_task_path=None,
+    client_histories=None,
+):
     # TODO: 使用历史任务原型初始化架构参数 alpha。
     # TODO: 在此处接入成本约束与搜索门控。
+    if (
+        getattr(args, "enable_arch_prior", False)
+        and not getattr(args, "resume", False)
+        and client_histories is not None
+        and prev_task_path is not None
+        and current_task_path is not None
+    ):
+        arch_prior_log_path = os.path.join(current_task_path, "logs", "arch_prior_details.jsonl")
+        client_artifact_dir = os.path.join(current_task_path, "client_subnets")
+        os.makedirs(client_artifact_dir, exist_ok=True)
+        fallback_learned_net_path = os.path.join(prev_task_path, "learned_net", "net.config")
+        for idx in client_indices:
+            history = client_histories[idx]
+            client = clients[idx]
+            client.arch_prior_state = None
+
+            previous_subnet = None
+            prev_client_artifact = history.subnet_artifacts.get(task_id - 1) if history is not None else None
+            if prev_client_artifact is not None:
+                previous_subnet = load_subnet_from_artifact(prev_client_artifact)
+            if previous_subnet is None and os.path.isfile(fallback_learned_net_path):
+                previous_subnet = load_previous_subnet_for_evaluation(os.path.join(prev_task_path, "learned_net"))
+
+            current_proto = None
+            if previous_subnet is not None:
+                try:
+                    current_proto = compute_task_prototype(
+                        previous_subnet,
+                        client.run_manager.run_config.train_loader,
+                        client.run_manager.device,
+                    )
+                except Exception as e:
+                    print(f"[ArchPrior] Failed to compute prototype for client {idx} task {task_id}: {e}")
+
+            similarity_scores = {}
+            selected_task_ids = []
+            weights = None
+            fused_arch_params = None
+            if current_proto is not None and history.has_any():
+                similarity_scores = compute_similarity_scores(current_proto, history.task_prototypes)
+                selected_task_ids, weights = build_arch_prior_weights(
+                    current_proto,
+                    history.task_prototypes,
+                    topk=getattr(args, "arch_prior_topk", 3),
+                    tau=getattr(args, "arch_prior_tau", 1.0),
+                )
+                fused_arch_params = build_fused_arch_parameters(
+                    history.arch_parameters,
+                    selected_task_ids,
+                    weights,
+                )
+                if fused_arch_params:
+                    client.arch_prior_state = {
+                        "task_id": int(task_id),
+                        "client_id": int(idx),
+                        "current_proto": current_proto.detach().cpu().clone(),
+                        "selected_task_ids": [int(task_i) for task_i in selected_task_ids],
+                        "weights": weights.detach().cpu().clone() if weights is not None else None,
+                        "similarity_scores": similarity_scores,
+                        "fused_arch_params": fused_arch_params,
+                        "artifact_path": os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}_subnet.pt"),
+                        "applied": False,
+                        "alpha_before_stats": summarize_arch_parameters(clone_arch_parameters(client.net)),
+                    }
+
+            if getattr(args, "log_arch_prior_details", True):
+                proto_stats = {}
+                if current_proto is not None:
+                    proto_float = current_proto.detach().float().cpu()
+                    proto_stats = {
+                        "current_proto_norm": float(proto_float.norm().item()),
+                        "current_proto_mean": float(proto_float.mean().item()),
+                        "current_proto_var": float(proto_float.var(unbiased=False).item()),
+                    }
+                append_arch_prior_log(
+                    arch_prior_log_path,
+                    {
+                        "event": "prior_prepared",
+                        "task_id": int(task_id),
+                        "client_id": int(idx),
+                        "enabled": True,
+                        "has_history": bool(history.has_any()),
+                        "has_previous_subnet": previous_subnet is not None,
+                        "selected_task_ids": [int(task_i) for task_i in selected_task_ids],
+                        "weights": weights.detach().cpu().tolist() if weights is not None else None,
+                        "similarity_scores": {int(k): float(v) for k, v in similarity_scores.items()},
+                        "topk": int(getattr(args, "arch_prior_topk", 3)),
+                        "tau": float(getattr(args, "arch_prior_tau", 1.0)),
+                        "alpha_before_stats": summarize_arch_parameters(clone_arch_parameters(client.net)),
+                        **proto_stats,
+                    },
+                )
+
     search_machine = ClusteringMachine(
         target_hardware="super_net",
         config=args,
@@ -270,6 +386,57 @@ def run_nas_search_for_task(args, task_id, global_server, clients, client_indice
         task_id=task_id,
     )
     search_machine.run()
+    if getattr(args, "enable_arch_prior", False) and client_histories is not None and current_task_path is not None:
+        arch_prior_log_path = os.path.join(current_task_path, "logs", "arch_prior_details.jsonl")
+        client_artifact_dir = os.path.join(current_task_path, "client_subnets")
+        os.makedirs(client_artifact_dir, exist_ok=True)
+        for idx in client_indices:
+            client = clients[idx]
+            history = client_histories[idx]
+            artifact_path = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}_subnet.pt")
+            normal_net = export_supernet_client_subnet(client, artifact_path)
+            prior_state = getattr(client, "arch_prior_state", None) or {}
+            current_proto = prior_state.get("current_proto")
+            if current_proto is None:
+                try:
+                    current_proto = compute_task_prototype(
+                        normal_net,
+                        client.run_manager.run_config.train_loader,
+                        client.run_manager.device,
+                    )
+                except Exception as e:
+                    print(f"[ArchPrior] Failed to compute post-search prototype for client {idx} task {task_id}: {e}")
+                    current_proto = None
+            arch_params = clone_arch_parameters(client.net)
+            if current_proto is not None:
+                history.task_prototypes[int(task_id)] = current_proto.detach().cpu().clone()
+            history.arch_parameters[int(task_id)] = arch_params
+            history.subnet_artifacts[int(task_id)] = artifact_path
+            if getattr(args, "log_arch_prior_details", True):
+                proto_stats = {}
+                if current_proto is not None:
+                    proto_float = current_proto.detach().float().cpu()
+                    proto_stats = {
+                        "stored_proto_norm": float(proto_float.norm().item()),
+                        "stored_proto_mean": float(proto_float.mean().item()),
+                        "stored_proto_var": float(proto_float.var(unbiased=False).item()),
+                    }
+                append_arch_prior_log(
+                    arch_prior_log_path,
+                    {
+                        "event": "history_updated",
+                        "task_id": int(task_id),
+                        "client_id": int(idx),
+                        "artifact_path": artifact_path,
+                        "history_size": len(history.arch_parameters),
+                        "stored_arch_stats": summarize_arch_parameters(arch_params),
+                        **proto_stats,
+                    },
+                )
+        save_client_histories(
+            client_histories,
+            os.path.join(current_task_path, "client_arch_prior_histories.pt"),
+        )
     return search_machine.get_server()
 
 
@@ -320,6 +487,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrain_last_round", type=int, default=20, help="重训阶段最后轮次，默认沿用 last_round")
     parser.add_argument("--retrain_sequence_from_task1", action="store_true",
                         help="重训阶段依次从 task1 训练到当前任务，每个任务各跑 retrain_last_round 轮")
+    parser.add_argument("--enable_arch_prior", action="store_true",
+                        help="是否在 NAS 搜索前启用历史先验引导的架构参数初始化，默认关闭")
+    parser.add_argument("--arch_prior_topk", type=int, default=3,
+                        help="历史先验 Top-K 任务数")
+    parser.add_argument("--arch_prior_tau", type=float, default=0.5,
+                        help="历史先验 softmax 温度参数")
+    parser.add_argument("--log_arch_prior_details", type=parse_optional_bool, default=True,
+                        help="是否记录历史先验的详细中间变量和统计量")
     
     
     parser.add_argument("--ewc_lambda", type=float, default=0.0,
@@ -611,6 +786,7 @@ def main():
 
     # 跨任务共享的 replay buffer（按 client 索引），避免每个任务重建导致忘记旧样本
     replay_buffers_across_tasks = [None for _ in range(args.num_users)]
+    client_histories = [ClientHistory() for _ in range(args.num_users)]
 
     def _load_replay_buffers(task_path: str):
         """从上一任务目录加载 replay buffer 状态，供断点续跑/跨任务继承。"""
@@ -647,6 +823,18 @@ def main():
         except Exception as e:
             print(f"[Replay] Failed to save replay buffers to {buf_path}: {e}")
         return max(0.0, time.time() - start)
+
+    def _load_client_history_bundle(task_path: str):
+        if not getattr(args, "enable_arch_prior", False):
+            return False
+        history_path = os.path.join(task_path, "client_arch_prior_histories.pt")
+        if not os.path.isfile(history_path):
+            return False
+        loaded_histories = load_client_histories(history_path, args.num_users)
+        for idx in range(args.num_users):
+            client_histories[idx] = loaded_histories[idx]
+        print(f"[ArchPrior] Loaded client histories from {history_path}")
+        return True
 
     def _load_model_from_checkpoint(model, checkpoint_path: str, desc: str):
         if not checkpoint_path or not os.path.isfile(checkpoint_path):
@@ -767,6 +955,10 @@ def main():
             pass
         # 尝试继承上一任务的超网权重
         prev_task_path = base_task_path + f"-task{task_id - 1}"
+        if getattr(args, "enable_arch_prior", False):
+            loaded_current_history = _load_client_history_bundle(args.path)
+            if (not loaded_current_history) and task_id > 1:
+                _load_client_history_bundle(prev_task_path)
         # 断点续跑 / 非首任务：尝试加载上一任务的 replay buffer
         if (
             args.enable_replay
@@ -1010,6 +1202,9 @@ def main():
                     global_server,
                     clients,
                     all_client_idx_arr,
+                    prev_task_path=prev_task_path,
+                    current_task_path=args.path,
+                    client_histories=client_histories,
                 )
                 print("完成super_net训练阶段")
 

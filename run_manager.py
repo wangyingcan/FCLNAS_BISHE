@@ -26,11 +26,7 @@ import random
 
 from auto_resume import atomic_torch_save
 from forgetting_mitigation import (
-    apply_ewc_regularization,
-    apply_orthogonal_update,
     apply_replay_loss,
-    ewc_is_enabled,
-    orthogonal_update_is_enabled,
     replay_is_enabled,
 )
 
@@ -422,17 +418,26 @@ class RunManager:
         self.task_forgetting = {}
         # 缓存标签到任务的映射，便于日志统计
         self._class_to_task_cache = None
-        # 用于 EWC 正则的快照与 Fisher 信息
+        # 已弃用的 EWC / 正交状态保留默认值，仅用于兼容旧辅助函数。
         self.ewc_prev_params = None
         self.ewc_fisher = None
-        self.ewc_lambda = float(getattr(run_config, "ewc_lambda", 0.0))
-        self.ewc_samples_per_task = int(getattr(run_config, "ewc_samples_per_task", 0))
-        self.ewc_online_interval = int(getattr(run_config, "ewc_online_interval", 0))
-        self.cl_reg_method = str(getattr(run_config, "cl_reg_method", "mas")).lower()
+        self.ewc_lambda = 0.0
+        self.ewc_samples_per_task = 0
+        self.ewc_online_interval = 0
+        self.cl_reg_method = "none"
         self.rwalk_path_score = None
-        self.cl_reg_decay = float(getattr(run_config, "cl_reg_decay", 1.0))
-        self.cl_reg_clip = getattr(run_config, "cl_reg_clip", None)
-        self.cl_penalty_clip = getattr(run_config, "cl_penalty_clip", None)
+        self.cl_reg_decay = 1.0
+        self.cl_reg_clip = None
+        self.cl_penalty_clip = None
+        self.cl_ortho_method = "none"
+        self.cl_ortho_scale = 0.0
+        self.ortho_samples_per_task = 0
+        self.ortho_kd_history_max = 0
+        self.ortho_ref_grads = None
+        self.kd_ortho_ref_grads = None
+        self.prev_grads = None
+        self.prev_kd_grads = None
+        self.prev_kd_grads_history = []
         # move network to GPU if available
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
@@ -470,29 +475,9 @@ class RunManager:
         self.cl_kd_conf_threshold = float(getattr(run_config, "cl_kd_conf_threshold", 0.5))
         self.teacher_model = None
         
-        # 正交更新超参与状态
-        self.cl_ortho_method = str(getattr(run_config, "cl_ortho_method", "none")).lower()
-        self.cl_ortho_scale = float(getattr(run_config, "cl_ortho_scale", 1.0))
-        self.ortho_samples_per_task = int(getattr(run_config, "ortho_samples_per_task", 0))
-        self.ortho_kd_history_max = int(getattr(run_config, "ortho_kd_history_max", 10))
-
-        # 存储旧任务的参考梯度方向（按参数名）
-        self.ortho_ref_grads = None  # dict[name] = tensor on CPU
-        # kd_ortho 专用：任务开始时预估的 KD 平均梯度
-        self.kd_ortho_ref_grads = None  # dict[name] = tensor on CPU
-        # prev_grad_ortho：上一轮梯度缓存（按参数名）
-        self.prev_grads = None  # dict[name] = tensor on CPU
-        # kd_prev_grad_ortho：上一轮梯度缓存（按参数名，需 teacher 支持）
-        self.prev_kd_grads = None  # dict[name] = tensor on CPU
-        self.prev_kd_grads_history = []  # list[dict], 维护多轮 KD 参考
-        
         search_phase = self.run_phase == "nas_search"
         self.enable_kd = bool(getattr(run_config, "enable_kd", False)) and not search_phase
         self.enable_replay = bool(getattr(run_config, "enable_replay", False)) and not search_phase
-        self.enable_ewc = bool(getattr(run_config, "enable_ewc", False)) and not search_phase
-        self.enable_orthogonal_update = (
-            bool(getattr(run_config, "enable_orthogonal_update", False)) and not search_phase
-        )
 
         # 重放配置
         self.replay_mode = str(getattr(run_config, "replay_mode", "none")).lower()
@@ -1452,58 +1437,18 @@ class RunManager:
                 break
             yield rep_x.to(self.device, non_blocking=True), rep_y.to(self.device, non_blocking=True)
 
-    def train_run_manager_one_epoch(self, adjust_lr_func, prev_params_snapshot=None, round_data_meter=None):
+    def train_run_manager_one_epoch(self, adjust_lr_func, round_data_meter=None):
         batch_time = AverageMeter()
         data_time = AverageMeter()
         losses = AverageMeter()
         top1 = AverageMeter()
         top5 = AverageMeter()
         lr = AverageMeter()
-        # RWalk 路径积分需要的累计表
-        if self.cl_reg_method == "rwalk" and self.rwalk_path_score is None:
-            self.rwalk_path_score = {
-                name: torch.zeros_like(param, device="cpu")
-                for name, param in self.net.module.named_parameters()
-                if param.requires_grad
-            }
-            
-        # 预估正交参考：
-        # - kd_ortho：任务开始时预估一个全局 g_old 参考
-        # - 其他 ortho：若还没有 ortho_ref_grads，尝试基于当前任务数据估计
-        # - prev_grad_ortho / kd_prev_grad_ortho：参考来自上一轮梯度，训练过程中动态更新，无需预估
-        if (
-            orthogonal_update_is_enabled(self)
-            and self.cl_ortho_method == "kd_ortho"
-            and self.teacher_model is not None
-            and self.cl_kd_logit_lambda > 0
-        ):
-            self.kd_ortho_ref_grads = self.build_kd_ortho_reference(
-                max_samples=self.ortho_samples_per_task
-            )
-        elif (
-            orthogonal_update_is_enabled(self)
-            and
-            self.cl_ortho_method != "none"
-            and self.cl_ortho_method != "kd_ortho"
-            and self.ortho_ref_grads is None
-            and self.ortho_samples_per_task is not None
-            and self.ortho_samples_per_task > 0
-        ):
-            ortho_ref, processed = self.compute_ortho_reference(
-                max_samples=self.ortho_samples_per_task
-            )
-            if ortho_ref is not None:
-                print(
-                    f"[Ortho] precomputed ortho_ref_grads for method={self.cl_ortho_method}, processed={processed}"
-                )
-        # kd_prev_grad_ortho：参考期望来自上一任务保存的 kd_prev_grads，不再用当前任务数据预估
-        # 若没有加载到有效的 prev_kd_grads，则后续训练中将跳过投影
 
         # switch to train mode
         self.net.train()
 
         end = time.time()
-        ewc_meter = AverageMeter()
 
         if getattr(self, "replay_only_training", False) and replay_is_enabled(self):
             data_iterable = self._buffer_train_iterator(self._buffer_train_batch_count)
@@ -1568,11 +1513,6 @@ class RunManager:
                     )
                 ce_loss = torch.zeros_like(ce_loss)
 
-            # EWC / MAS / RWalk 正则项
-            ewc_penalty = apply_ewc_regularization(self)
-            if ewc_penalty is not None:
-                ewc_meter.update(ewc_penalty.item(), images.size(0))
-
             # ========== KD logit loss（只算数值，真正用在哪取决于模式）==========
             kd_loss = None
             if (
@@ -1605,20 +1545,13 @@ class RunManager:
                     else:
                         kd_loss = None
 
-            # ========== kd_ortho 模式 / 其余ortho 方法 ==========
             # ========== 统一 total_loss 计算 ==========
             total_loss = ce_loss
             if kd_loss is not None:
                 total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
-            if ewc_penalty is not None:
-                penalty_term = self.ewc_lambda * ewc_penalty
-                if self.cl_penalty_clip is not None:
-                    penalty_term = torch.clamp(
-                        penalty_term, max=self.cl_penalty_clip
-                    )
-                total_loss = total_loss + penalty_term
-
-            cos_before, cos_after = apply_orthogonal_update(self, total_loss, kd_loss=kd_loss)
+            self.optimizer.zero_grad()
+            self.net.zero_grad()
+            total_loss.backward()
 
             # 更新参数
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
@@ -1628,29 +1561,6 @@ class RunManager:
             if replay_is_enabled(self):
                 self.replay_buffer.add_batch(cur_x_cpu, cur_y_cpu, self.task_id)
                 
-            # RWalk 路径积分累积
-            if (
-                self.cl_reg_method == "rwalk"
-                and prev_params_snapshot is not None
-                and self.rwalk_path_score is not None
-            ):
-                with torch.no_grad():
-                    for name, param in self.net.module.named_parameters():
-                        if name not in prev_params_snapshot:
-                            continue
-                        delta = (param.detach().cpu() - prev_params_snapshot[name])
-                        self.rwalk_path_score[name] += delta.abs()
-                        prev_params_snapshot[name] = param.detach().cpu().clone()
-
-            # 打印正交余弦信息（仅当有投影时）
-            if (
-                orthogonal_update_is_enabled(self)
-                and cos_before is not None
-                and cos_after is not None
-                and (i % 50 == 0)
-            ):
-                print(f"[{self.cl_ortho_method}] batch {i}, cos(before)={cos_before:.4f}, cos(after)={cos_after:.4f}")
-
             # ========== 统计&时间 ==========
             acc1, acc5 = accuracy(output, labels, topk=(1, 5))
             losses.update(total_loss.item(), images.size(0))
@@ -1661,7 +1571,7 @@ class RunManager:
             batch_time.update(time.time() - end)
             end = time.time()
 
-        return top1, top5, losses, lr, ewc_meter
+        return top1, top5, losses, lr
     
     def apply_ortho_projection(self, return_cos: bool = False):
         """
@@ -1870,8 +1780,9 @@ class RunManager:
         server_model=None,
         writer=None,
         global_round_idx=None,
+        preserve_local_model=False,
     ):
-        if server_model != None:
+        if server_model != None and not preserve_local_model:
             if isinstance(server_model, nn.DataParallel):
                 self.net.module.load_state_dict(server_model.module.state_dict())
             else:
@@ -1938,20 +1849,11 @@ class RunManager:
                 prefix="train",
                 should_print=True,
             )
-        # RWalk 路径快照
-        prev_params_snapshot = None
-        if self.cl_reg_method == "rwalk":
-            prev_params_snapshot = {
-                name: param.detach().cpu().clone()
-                for name, param in self.net.module.named_parameters()
-                if param.requires_grad
-            }
         for epoch in range(start_epoch, n_epochs):
-            train_acc_top1, train_acc_top5, train_losses, lr, ewc_meter = self.train_run_manager_one_epoch(
+            train_acc_top1, train_acc_top5, train_losses, lr = self.train_run_manager_one_epoch(
                 lambda i: self.run_config.adjust_learning_rate(
                     self.optimizer, epoch, i, nBatch
                 ),
-                prev_params_snapshot=prev_params_snapshot,
                 round_data_meter=round_data_stats,
             )
             train_acc_top1_arr.update(train_acc_top1.avg)
@@ -1962,8 +1864,6 @@ class RunManager:
             writer.add_scalar(tb_prefix + "_trn_top1", train_acc_top1.avg, epoch)
             writer.add_scalar(tb_prefix + "_trn_top5", train_acc_top5.avg, epoch)
             writer.add_scalar(tb_prefix + "_trn_loss", train_losses.avg, epoch)
-            if ewc_is_enabled(self):
-                writer.add_scalar(tb_prefix + "_ewc_penalty", ewc_meter.avg, epoch)
 
             if epoch % 3 == 0:
                 val_loss, val_acc, val_acc5 = self.validate(
@@ -2072,24 +1972,12 @@ class CifarRunConfig(RunConfig):
         search=True,
         task_id=1,
         is_client:bool=True,
-        ewc_lambda: float = 0.0,
-        ewc_samples_per_task: int = 0,
-        ewc_online_interval: int = 0,
-        cl_reg_method: str = "mas",
-        cl_reg_decay: float = 1.0,
-        cl_reg_clip: float = None,
-        cl_penalty_clip: float = None,
         cl_kd_method: str = "none",
         cl_kd_logit_lambda: float = 0.0,
         cl_kd_temperature: float = 2.0,
         cl_kd_conf_threshold: float = 0.5,
         enable_kd: bool = False,
-        cl_ortho_method: str = "none",
-        cl_ortho_scale: float = 1.0,
-        ortho_samples_per_task: int = 2048,
         enable_replay: bool = False,
-        enable_ewc: bool = False,
-        enable_orthogonal_update: bool = False,
         **kwargs,
     ):
         print(f"CifarRunConfig初始化开始... is_client={is_client} client_id={client_id}")
@@ -2132,13 +2020,6 @@ class CifarRunConfig(RunConfig):
         self.iid = bool(int(iid)) if isinstance(iid, (int, bool, str)) else bool(iid)
         self.dirichlet_alpha = float(dirichlet_alpha)
         self.val_ratio = float(val_ratio)
-        self.ewc_lambda = float(ewc_lambda)
-        self.ewc_samples_per_task = int(ewc_samples_per_task)
-        self.ewc_online_interval = int(ewc_online_interval)
-        self.cl_reg_method = str(cl_reg_method).lower()
-        self.cl_reg_decay = float(cl_reg_decay)
-        self.cl_reg_clip = cl_reg_clip
-        self.cl_penalty_clip = cl_penalty_clip
         
         # KD 相关
         self.cl_kd_method = str(cl_kd_method).lower()
@@ -2146,14 +2027,7 @@ class CifarRunConfig(RunConfig):
         self.cl_kd_temperature = float(cl_kd_temperature)
         self.cl_kd_conf_threshold = float(cl_kd_conf_threshold)
         self.enable_kd = bool(enable_kd)
-        
-        # 正交更新相关
-        self.cl_ortho_method = str(cl_ortho_method).lower()
-        self.cl_ortho_scale = float(cl_ortho_scale)
-        self.ortho_samples_per_task = int(ortho_samples_per_task)
         self.enable_replay = bool(enable_replay)
-        self.enable_ewc = bool(enable_ewc)
-        self.enable_orthogonal_update = bool(enable_orthogonal_update)
 
         # 推导每任务类别数（若未显式给出）
         total_classes = None

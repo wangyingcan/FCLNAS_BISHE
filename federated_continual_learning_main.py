@@ -523,22 +523,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_arch_prior_details", type=parse_optional_bool, default=True,
                         help="是否记录历史先验的详细中间变量和统计量")
     
-    
-    parser.add_argument("--ewc_lambda", type=float, default=0.0,
-                        help="重训阶段的 EWC 正则强度，0 表示关闭")
-    parser.add_argument("--ewc_samples_per_task", type=int, default=512,
-                        help="计算 Fisher 时使用的样本上限，设为 0 可跳过 Fisher 估计")
-    parser.add_argument("--ewc_online_interval", type=int, default=0,
-                        help="每隔多少 retrain round 在线累积一次 Fisher（0 表示仅在任务结束后计算）")
-    parser.add_argument("--cl_reg_method", type=str, default="none",
-                        choices=["ewc", "mas", "rwalk","none"],
-                        help="持续学习正则方法：ewc / MAS / RWalk（默认 mas）")
-    parser.add_argument("--cl_reg_decay", type=float, default=1.0,
-                        help="重要性衰减系数，<1 表示按比例保留历史重要性后再累加新重要性")
-    parser.add_argument("--cl_reg_clip", type=float, default=None,
-                        help="重要性裁剪上限，None 表示不裁剪")
-    parser.add_argument("--cl_penalty_clip", type=float, default=None,
-                        help="正则项裁剪上限，防止 total_loss 爆炸，None 表示不裁剪")
     parser.add_argument("--cl_kd_method", type=str, default="none",
                         choices=["none", "logit", "logit_conf"],
                         help="持续学习蒸馏方法：none / logit / logit_conf")
@@ -548,9 +532,6 @@ def parse_args() -> argparse.Namespace:
                         help="logit 蒸馏的温度系数 T")
     parser.add_argument("--cl_kd_conf_threshold", type=float, default=0.5,
                         help="logit_conf 模式下 teacher 置信度阈值，低于该值的类不参与 KD")
-    parser.add_argument("--cl_ortho_method",type=str,default="none",choices=["none", "ogd", "pcgrad", "kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"],help="持续学习的正交更新方法：none / ogd / pcgrad / kd_ortho",)
-    parser.add_argument("--cl_ortho_scale",type=float,default=1.0,help="正交投影强度系数，1.0 表示完全投影到正交子空间，<1 为部分投影",)
-    parser.add_argument("--ortho_samples_per_task",type=int,default=2048,help="估计旧任务梯度方向时使用的样本上限，0 表示不估计（禁用正交基更新）",)
     parser.add_argument("--replay_mode", type=str, default="none", choices=["none", "global", "task_balanced", "age_priority"], help="experience replay 模式：none/global/task_balanced/age_priority")
     parser.add_argument("--replay_capacity", type=int, default=0, help="重放缓冲区最大样本量（全局计数）")
     parser.add_argument("--replay_capacity_ratio", type=float, default=None, help="按全训练集样本数的比例设置缓冲区容量（0~1），高于 replay_capacity 时覆盖之")
@@ -559,30 +540,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay_old_task_scale_by_F", type=float, default=0.0, help="按遗忘程度动态放大旧任务样本权重，0 表示不启用，单位：每个遗忘点数的放大系数")
     parser.add_argument("--enable_replay", action="store_true",
                         help="是否在子网重训阶段启用 replay 模块，默认关闭")
-    parser.add_argument("--enable_ewc", action="store_true",
-                        help="是否在子网重训阶段启用 EWC 模块，默认关闭")
     parser.add_argument("--enable_kd", action="store_true",
                         help="是否在子网重训阶段启用 logit KD 模块，默认关闭")
-    parser.add_argument("--enable_orthogonal_update", action="store_true",
-                        help="是否在子网重训阶段启用正交更新模块，默认关闭")
     
     
     # 分阶段可选覆盖：当前仅保留 retrain_*；search 阶段的遗忘相关覆盖已停用
-    parser.add_argument("--retrain_cl_ortho_method", type=str, default=None, choices=["none","ogd","pcgrad","kd_ortho","prev_grad_ortho","kd_prev_grad_ortho"])
-    parser.add_argument("--retrain_cl_ortho_scale", type=float, default=None)
-    parser.add_argument("--retrain_ortho_samples_per_task", type=int, default=None)
     parser.add_argument("--retrain_cl_kd_method", type=str, default=None, choices=["none","logit","logit_conf"])
     parser.add_argument("--retrain_cl_kd_logit_lambda", type=float, default=None)
     parser.add_argument("--retrain_cl_kd_temperature", type=float, default=None)
     parser.add_argument("--retrain_cl_kd_conf_threshold", type=float, default=None)
     parser.add_argument("--retrain_enable_kd", type=parse_optional_bool, default=None)
-    parser.add_argument("--retrain_ewc_lambda", type=float, default=None)
-    parser.add_argument("--retrain_ewc_samples_per_task", type=int, default=None)
-    parser.add_argument("--retrain_ewc_online_interval", type=int, default=None)
-    parser.add_argument("--retrain_cl_reg_method", type=str, default=None, choices=["ewc","mas","rwalk"])
-    parser.add_argument("--retrain_cl_reg_decay", type=float, default=None)
-    parser.add_argument("--retrain_cl_reg_clip", type=float, default=None)
-    parser.add_argument("--retrain_cl_penalty_clip", type=float, default=None)
     parser.add_argument("--retrain_replay_mode", type=str, default=None, choices=["none", "global", "task_balanced", "age_priority"])
     parser.add_argument("--retrain_replay_capacity", type=int, default=None)
     parser.add_argument("--retrain_replay_capacity_ratio", type=float, default=None)
@@ -705,6 +672,32 @@ def parse_args() -> argparse.Namespace:
     # --reg_use_ewc
     # They were used by the old "search stage + forgetting mitigation" pipeline.
     # The current NAS stage is intentionally clean and no longer consumes them.
+    #
+    # Archived unused retrain-stage forgetting arguments after switching to
+    # personalized no-aggregation retrain:
+    # --ewc_lambda
+    # --ewc_samples_per_task
+    # --ewc_online_interval
+    # --cl_reg_method
+    # --cl_reg_decay
+    # --cl_reg_clip
+    # --cl_penalty_clip
+    # --cl_ortho_method
+    # --cl_ortho_scale
+    # --ortho_samples_per_task
+    # --enable_ewc
+    # --enable_orthogonal_update
+    # --retrain_ewc_lambda
+    # --retrain_ewc_samples_per_task
+    # --retrain_ewc_online_interval
+    # --retrain_cl_reg_method
+    # --retrain_cl_reg_decay
+    # --retrain_cl_reg_clip
+    # --retrain_cl_penalty_clip
+    # --retrain_cl_ortho_method
+    # --retrain_cl_ortho_scale
+    # --retrain_ortho_samples_per_task
+    # EWC / orthogonal update are no longer part of the active retrain path.
 
     args = parser.parse_args()
     print("set格式化参数结束...")
@@ -713,21 +706,11 @@ def parse_args() -> argparse.Namespace:
     args._phase_base_params = {
         k: getattr(args, k)
         for k in [
-            "cl_ortho_method",
-            "cl_ortho_scale",
-            "ortho_samples_per_task",
             "cl_kd_method",
             "cl_kd_logit_lambda",
             "cl_kd_temperature",
             "cl_kd_conf_threshold",
             "enable_kd",
-            "ewc_lambda",
-            "ewc_samples_per_task",
-            "ewc_online_interval",
-            "cl_reg_method",
-            "cl_reg_decay",
-            "cl_reg_clip",
-            "cl_penalty_clip",
             "replay_mode",
             "replay_capacity",
             "replay_capacity_ratio",
@@ -881,7 +864,33 @@ def main():
             return False
 
     def _restore_retrain_bootstrap(checkpoint_path: str, global_run_manager: RunManager, clients: list):
-        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+        if not checkpoint_path:
+            return False
+        if os.path.isdir(checkpoint_path):
+            loaded_rounds = []
+            restored_any = False
+            for idx, rm in enumerate(clients):
+                client_ckpt = os.path.join(checkpoint_path, f"client_{idx}", "checkpoint", "checkpoint.pth.tar")
+                if not os.path.isfile(client_ckpt):
+                    continue
+                try:
+                    checkpoint = torch.load(client_ckpt, map_location="cpu")
+                    state_dict = checkpoint.get("state_dict", checkpoint)
+                    rm.net.module.load_state_dict(state_dict, strict=False)
+                    rm.round = int(checkpoint.get("round", -1)) + 1
+                    opt_key = f"{idx}_weight_optimizer"
+                    if opt_key in checkpoint:
+                        rm.optimizer.load_state_dict(checkpoint[opt_key])
+                    loaded_rounds.append(rm.round)
+                    restored_any = True
+                except Exception as e:
+                    print(f"[AutoResume] Failed to restore client {idx} bootstrap from {client_ckpt}: {e}")
+            if restored_any:
+                global_run_manager.round = max(loaded_rounds) if loaded_rounds else 0
+                print(f"[AutoResume] Bootstrapped personalized retrain stage from {checkpoint_path}")
+                return True
+            return False
+        if not os.path.isfile(checkpoint_path):
             return False
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -915,8 +924,6 @@ def main():
     retrain_helpers = RetrainPipelineHelpers(
         attach_replay_cfg=_attach_replay_cfg,
         load_prev_task=load_prev_task,
-        load_state_with_fallback=_load_state_with_fallback,
-        save_state_safely=_save_state_safely,
         save_replay_buffers=_save_replay_buffers,
         load_model_from_checkpoint=_load_model_from_checkpoint,
         restore_retrain_bootstrap=_restore_retrain_bootstrap,

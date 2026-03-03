@@ -80,11 +80,13 @@ class CommonwealthMachine:
         print('self.config.resume: ', self.config.resume)
         if self.config.resume:
             try:
-                print('loading global_run_manager model:')
-                self.global_run_manager.load_model()
+                print('loading personalized client checkpoints:')
+                loaded_rounds = []
                 for id in self.clients_idx_arr:
-                    print(id)
+                    self.clients[id].load_model()
                     self.clients[id].load_clients_opt()
+                    loaded_rounds.append(getattr(self.clients[id], "round", 0))
+                self.global_run_manager.round = max(loaded_rounds) if loaded_rounds else 0
             except Exception as e:
                 print('Exception about load clients opt:', e)
 
@@ -92,9 +94,10 @@ class CommonwealthMachine:
         # 如果不是断点恢复，将 round 重置为 0，避免继承旧 checkpoint 的 round 导致轮数偏移
         if not getattr(self.config, "resume", False):
             self.global_run_manager.round = 0
+            for idx in self.clients_idx_arr:
+                self.clients[idx].round = 0
             self.start_round = 0
         print(f"[Retrain] start_round={self.start_round}, last_round={self.last_round}")
-        best_val_acc = 0
         for round in range(self.start_round, self.last_round):
             print('round', round+1)
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
@@ -103,9 +106,7 @@ class CommonwealthMachine:
             aggregation_time = 0.0
             evaluation_time = 0.0
             checkpoint_io_time = 0.0
-            clients_params_arr, clients_data_w = [], []
             round_time = time.time()
-            server_model = copy.deepcopy(self.global_run_manager.net.module)
             start_local_epoch, last_local_epoch = arrange_local_epoch_from_round(global_round=round,
                                                                                  local_epoch_number=self.local_epoch_number)
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
@@ -114,11 +115,16 @@ class CommonwealthMachine:
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = self.clients[idx].train_run_manager(
                     start_local_epoch=start_local_epoch,
                     last_local_epoch=last_local_epoch,
-                    server_model=server_model,
+                    server_model=None,
                     writer=self.writerTf,
-                    global_round_idx=round + 1)
-                clients_params_arr.append(copy.deepcopy(self.clients[idx].return_model_dict()))
-                clients_data_w.append(self.clients[idx].get_local_data_weight())
+                    global_round_idx=round + 1,
+                    preserve_local_model=(
+                        round == self.start_round
+                        and bool(getattr(self.clients[idx], "preserve_local_model_for_first_sync", False))
+                    ),
+                )
+                if round == self.start_round:
+                    self.clients[idx].preserve_local_model_for_first_sync = False
                 client_round_prefix = f"task_{self.clients[idx].task_id}_client_{idx}_round"
                 self.writerTf.add_scalar(client_round_prefix + "_trn_loss", trn_loss, round)
                 self.writerTf.add_scalar(client_round_prefix + "_trn_top1", trn_top1, round)
@@ -151,6 +157,14 @@ class CommonwealthMachine:
                     val_top5=val_top5,
                     lr=lr,
                 )
+                client_checkpoint = {
+                    "round": round,
+                    "state_dict": self.clients[idx].net.module.state_dict(),
+                    f"{idx}_weight_optimizer": self.clients[idx].optimizer.state_dict(),
+                }
+                client_checkpoint_io_start = time.time()
+                self.clients[idx].save_model(client_checkpoint, is_best=False)
+                checkpoint_io_time += time.time() - client_checkpoint_io_start
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)
@@ -175,90 +189,19 @@ class CommonwealthMachine:
                     clients_lr.avg,
                     round_time_use),
                 prefix='retrain')
-
-            # 联邦聚合
-            aggregation_start = time.time()
-            new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
-            server_dict = self.global_run_manager.net.module.state_dict()
-            server_dict.update(new_weight_fedavg)
-            missing, unexpected = self.global_run_manager.net.module.load_state_dict(server_dict, strict=False)
-            aggregation_time += time.time() - aggregation_start
-            
-            # 记录多余的或缺失的键
-            if missing or unexpected:
-                self.write_log(
-                    f"[FEDAVG] round {round} load_state_dict missing={len(missing)}, unexpected={len(unexpected)}",
-                    prefix="retrain",
-                    should_print=True,
-                )
-
-            # 在验证集上跑一下 + 保存最优模型
+            # personalized retrain: no federated aggregation in this stage
             evaluation_start = time.time()
-            self.global_run_manager.net.module.eval()
-            with torch.no_grad():
-                val_loss, val_acc_top1, val_acc_top5 = self.global_run_manager.validate(is_test=False, return_top5=True)
-                if best_val_acc < val_acc_top1:
-                    best_val_acc = val_acc_top1
-                    is_best = True
-                else:
-                    is_best = False
-                
-                checkpoint = {}
-                checkpoint['round'] = round
-                checkpoint['state_dict'] = self.global_run_manager.net.module.state_dict()
-                for id in self.clients_idx_arr:
-                    checkpoint[str(id) + '_weight_optimizer'] = self.clients[
-                        id].optimizer.state_dict()
-                checkpoint_io_start = time.time()
-                self.global_run_manager.save_model(checkpoint, is_best=is_best)
-                checkpoint_io_time += time.time() - checkpoint_io_start
-                checkpoint_io_time += self._emit_progress(
-                    "retrain_round_completed",
-                    round_idx=round,
-                    checkpoint_path=os.path.join(self.global_run_manager.save_path, "checkpoint.pth.tar"),
-                )
-                
-                self.writerTf.add_scalar('global_test_loss', val_loss, round)
-                self.writerTf.add_scalar('global_test_top1', val_acc_top1, round)
-                self.writerTf.add_scalar('global_test_top5', val_acc_top5, round)
+            avg_test_loss, avg_test_top1, avg_test_top5 = self.test_inference(tag="learned_net")
+            self.writerTf.add_scalar('global_test_loss', avg_test_loss, round)
+            self.writerTf.add_scalar('global_test_top1', avg_test_top1, round)
+            self.writerTf.add_scalar('global_test_top5', avg_test_top5, round)
             evaluation_time += time.time() - evaluation_start
-                    
-            # 在测试集上跑一下 + 正则化
-            self.test_inference(tag="learned_net")
-            # 在线累积 EWC：按设定轮次或最后一轮计算 Fisher
-            if (
-                getattr(self.config, "enable_ewc", False)
-                and
-                getattr(self.config, "ewc_lambda", 0) > 0
-                and getattr(self.config, "ewc_online_interval", 0) > 0
-                and (
-                    (round + 1) % int(self.config.ewc_online_interval) == 0
-                    or round == self.last_round - 1
-                )
-            ):
-                fisher, processed = self.global_run_manager.compute_importance(
-                    max_samples=getattr(self.config, "ewc_samples_per_task", None)
-                )
-                if fisher is not None:
-                    # 在线阶段仅累积 Fisher，不更新参考参数，避免 anchor 随当前任务漂移
-                    self.global_run_manager.consolidate_ewc(fisher, update_prev_params=False)
-                    stats = {
-                        "fisher_keys": len(fisher),
-                        "fisher_norm": sum(v.sum().item() for v in fisher.values()),
-                        "processed": processed,
-                    }
-                    self.write_log(
-                        f"[EWC] round {round} consolidate fisher_keys={stats['fisher_keys']} "
-                        f"fisher_norm={stats['fisher_norm']:.4f} processed={stats['processed']}",
-                        prefix="retrain",
-                        should_print=True,
-                    )
-                else:
-                    self.write_log(
-                        f"[EWC] round {round} fisher is None (processed={processed}), skip consolidate",
-                        prefix="retrain",
-                        should_print=True,
-                    )
+            checkpoint_io_time += self._emit_progress(
+                "retrain_round_completed",
+                round_idx=round,
+                checkpoint_path=os.path.join(self.path, "clients"),
+            )
+            self.global_run_manager.round = round + 1
             wall_clock_time = time.time() - round_wall_start
             algorithm_time = local_compute_time + aggregation_time + evaluation_time
             runtime_context = getattr(self.config, "runtime_context", None)
@@ -306,16 +249,32 @@ class CommonwealthMachine:
 
     
     def test_inference(self, tag=None):
-        # Test inference after completion of training
-        val_loss, val_acc_top1, val_acc_top5 = self.global_run_manager.validate(is_test=True, return_top5=True)
+        # Test inference after completion of training. For personalized retrain, report cluster-average client accuracy.
+        client_losses = AverageMeter()
+        client_top1 = AverageMeter()
+        client_top5 = AverageMeter()
+        for idx in self.clients_idx_arr:
+            val_loss, val_acc_top1, val_acc_top5 = self.clients[idx].validate(is_test=True, return_top5=True)
+            client_losses.update(val_loss)
+            client_top1.update(val_acc_top1)
+            client_top5.update(val_acc_top5)
+            try:
+                self.clients[idx].write_log(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] client{idx},test_eval loss {val_loss:.4f}, top1 {val_acc_top1:.4f}, top5 {val_acc_top5:.4f}",
+                    prefix='test',
+                    should_print=False,
+                )
+            except Exception:
+                pass
         prefix_name = tag if tag is not None else self.hardware
         self.write_log(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] " +
             "{},test_eval loss {:.4f}, top1 {:.4f}, top5 {:.4f}".format(
-                prefix_name, val_loss, val_acc_top1, val_acc_top5 
+                prefix_name, client_losses.avg, client_top1.avg, client_top5.avg 
             ),
             prefix='test',
             should_print=True
         )
+        return client_losses.avg, client_top1.avg, client_top5.avg
 
     
     def write_log(self, log_str, prefix, should_print=True, end='\n'):

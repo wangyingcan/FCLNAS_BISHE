@@ -2097,6 +2097,9 @@ class CifarRunConfig(RunConfig):
         num_users = kwargs.get("num_users", 10)
         num_tasks = kwargs.get("num_tasks", 10)
         explicit_cpt = kwargs.get("classes_per_task", None)
+        iid = kwargs.get("iid", 0)
+        dirichlet_alpha = kwargs.get("dirichlet_alpha", 0.3)
+        val_ratio = kwargs.get("val_ratio", 0.1)
 
         super(CifarRunConfig, self).__init__(
             client_id,
@@ -2126,6 +2129,9 @@ class CifarRunConfig(RunConfig):
         self.n_worker = n_worker
         self.num_clients = int(num_users)
         self.num_tasks = int(num_tasks)
+        self.iid = bool(int(iid)) if isinstance(iid, (int, bool, str)) else bool(iid)
+        self.dirichlet_alpha = float(dirichlet_alpha)
+        self.val_ratio = float(val_ratio)
         self.ewc_lambda = float(ewc_lambda)
         self.ewc_samples_per_task = int(ewc_samples_per_task)
         self.ewc_online_interval = int(ewc_online_interval)
@@ -2180,6 +2186,9 @@ class CifarRunConfig(RunConfig):
             "num_clients": self.num_clients,
             "num_tasks": self.num_tasks,
             "classes_per_task": self.classes_per_task,
+            "iid": self.iid,
+            "alpha": self.dirichlet_alpha,
+            "val_ratio": self.val_ratio,
             "search": self.search,
         }
 

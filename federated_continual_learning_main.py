@@ -489,6 +489,10 @@ def parse_args() -> argparse.Namespace:
                         help="search target(0:supernet, 1:cpu, 2:gpu8, 3:flops) latency for 1/2 , compute source for 3.")
     parser.add_argument("--iid", type=int, default=0,
                         help="Default set 1 to IID. Set to 0 for non-IID.")
+    parser.add_argument("--dirichlet_alpha", type=float, default=0.3,
+                        help="Dirichlet alpha for non-IID client split. Ignored when --iid 1.")
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="Validation split ratio inside each client/task partition.")
     parser.add_argument("--unequal", type=int, default=1,
                         help="whether to use unequal data splits for non-i.i.d setting (use 0 for equal splits)")
 
@@ -736,11 +740,12 @@ def parse_args() -> argparse.Namespace:
     # 派生参数：保持原逻辑
     args.n_epochs = args.local_epoch_number * (args.last_round - args.start_round)
 
-    # 构建保存目录名（原文件两次赋值，合并为等价流程，行为不变）
-    base_path = "./output_test1/fednas-" + args.arch_algo + str(args.manual_seed)
-    if args.target_hardware is not None:
-        base_path += args.target_hardware
-    args.path = base_path + str(args.n_cell_stages)
+    # 构建保存目录名；若用户显式传入 --path，则直接使用该路径作为实验基路径。
+    if args.path == parser.get_default("path"):
+        base_path = "./output_test1/fednas-" + args.arch_algo + str(args.manual_seed)
+        if args.target_hardware is not None:
+            base_path += args.target_hardware
+        args.path = base_path + str(args.n_cell_stages)
 
     # env_dir 命名（与原等价）
     args.save_env = "env_dir/search-{}-{}-{}-{}".format(

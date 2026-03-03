@@ -1,4 +1,3 @@
-import copy
 import json
 import os
 from dataclasses import dataclass, field
@@ -9,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from auto_resume import atomic_torch_save
+from models.super_nets.super_proxyless import SuperProxylessNASNets
 
 
 ArchParamType = List[torch.Tensor]
@@ -263,8 +263,19 @@ def load_client_histories(load_path: str, num_clients: int) -> List[ClientHistor
     return histories
 
 
-def export_supernet_client_subnet(search_manager, artifact_path: str):
-    supernet_copy = copy.deepcopy(search_manager.net).cpu()
+def export_supernet_client_subnet(search_manager, artifact_path: str, supernet_kwargs: dict):
+    export_kwargs = dict(supernet_kwargs)
+    export_kwargs["width_stages"] = list(export_kwargs.get("width_stages", []))
+    export_kwargs["n_cell_stages"] = list(export_kwargs.get("n_cell_stages", []))
+    export_kwargs["stride_stages"] = list(export_kwargs.get("stride_stages", []))
+    export_kwargs["conv_candidates"] = list(export_kwargs.get("conv_candidates", []))
+
+    supernet_copy = SuperProxylessNASNets(**export_kwargs).cpu()
+    source_state_dict = {
+        key: value.detach().cpu().clone()
+        for key, value in search_manager.net.state_dict().items()
+    }
+    supernet_copy.load_state_dict(source_state_dict, strict=True)
     normal_net = supernet_copy.convert_to_normal_net()
     payload = {
         "net_config": normal_net.config,

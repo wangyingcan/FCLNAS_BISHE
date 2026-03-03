@@ -394,7 +394,21 @@ def run_nas_search_for_task(
             client = clients[idx]
             history = client_histories[idx]
             artifact_path = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}_subnet.pt")
-            normal_net = export_supernet_client_subnet(client, artifact_path)
+            normal_net = export_supernet_client_subnet(
+                client,
+                artifact_path,
+                {
+                    "width_stages": args.width_stages,
+                    "n_cell_stages": args.n_cell_stages,
+                    "stride_stages": args.stride_stages,
+                    "conv_candidates": args.conv_candidates,
+                    "n_classes": client.run_manager.run_config.data_provider.n_classes,
+                    "width_mult": args.width_mult,
+                    "bn_param": (args.bn_momentum, args.bn_eps),
+                    "dropout_rate": args.dropout,
+                    "inference_device": args.object_to_search,
+                },
+            )
             prior_state = getattr(client, "arch_prior_state", None) or {}
             current_proto = prior_state.get("current_proto")
             if current_proto is None:

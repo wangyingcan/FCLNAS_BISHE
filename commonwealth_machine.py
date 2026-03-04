@@ -75,6 +75,64 @@ class CommonwealthMachine:
             return max(0.0, time.time() - start)
         return 0.0
 
+    @staticmethod
+    def _model_signature_summary(model):
+        state = model.state_dict()
+        floating = [p.flatten().float() for p in state.values() if torch.is_tensor(p) and p.dtype.is_floating_point]
+        if not floating:
+            return {"global_norm": 0.0, "global_mean": 0.0, "global_std": 0.0, "classifier_norm": 0.0}
+        flat = torch.cat(floating)
+        classifier_norm = 0.0
+        for key in ["classifier.linear.weight", "classifier.weight", "linear.weight", "fc.weight"]:
+            if key in state and torch.is_tensor(state[key]):
+                classifier_norm = float(state[key].float().norm())
+                break
+        return {
+            "global_norm": float(flat.norm()),
+            "global_mean": float(flat.mean()),
+            "global_std": float(flat.std()),
+            "classifier_norm": classifier_norm,
+        }
+
+    def _log_retrain_init_snapshot(self):
+        for idx in self.clients_idx_arr:
+            client = self.clients[idx]
+            source = getattr(client, "personalized_subnet_source", "unknown")
+            artifact = getattr(client, "personalized_subnet_artifact", None)
+            sig = self._model_signature_summary(client.net.module)
+            try:
+                init_loss, init_top1, init_top5 = client.validate(is_test=True, return_top5=True)
+            except Exception as e:
+                init_loss, init_top1, init_top5 = float("nan"), float("nan"), float("nan")
+                self.write_log(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] retrain client{idx} init_eval_failed source={source} error={e}",
+                    prefix="retrain",
+                )
+            self.write_log(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                f"retrain client{idx} init_eval source={source} "
+                f"artifact={artifact} test_loss {init_loss:.4f}, test_top1 {init_top1:.4f}, test_top5 {init_top5:.4f}, "
+                f"global_norm {sig['global_norm']:.4f}, classifier_norm {sig['classifier_norm']:.4f}",
+                prefix="retrain",
+            )
+            self._append_per_client_metric(
+                -1,
+                idx,
+                source=source,
+                artifact_path=artifact,
+                init_test_loss=float(init_loss),
+                init_test_top1=float(init_top1),
+                init_test_top5=float(init_top5),
+                model_global_norm=float(sig["global_norm"]),
+                model_global_mean=float(sig["global_mean"]),
+                model_global_std=float(sig["global_std"]),
+                classifier_norm=float(sig["classifier_norm"]),
+            )
+            client_round_prefix = f"task_{client.task_id}_client_{idx}_init"
+            self.writerTf.add_scalar(client_round_prefix + "_test_loss", init_loss, 0)
+            self.writerTf.add_scalar(client_round_prefix + "_test_top1", init_top1, 0)
+            self.writerTf.add_scalar(client_round_prefix + "_test_top5", init_top5, 0)
+
     
     def run(self):
         print('self.config.resume: ', self.config.resume)
@@ -98,6 +156,7 @@ class CommonwealthMachine:
                 self.clients[idx].round = 0
             self.start_round = 0
         print(f"[Retrain] start_round={self.start_round}, last_round={self.last_round}")
+        self._log_retrain_init_snapshot()
         for round in range(self.start_round, self.last_round):
             print('round', round+1)
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()

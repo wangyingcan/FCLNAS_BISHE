@@ -267,10 +267,12 @@ def run_supernet_retrain_pipeline(
         all_client_idx_arr.append(idx)
         client_artifact_path = os.path.join(client_subnet_dir, f"client_{idx}_task_{task_id}_subnet.pt")
         client_net, _ = _load_client_subnet_artifact(client_artifact_path)
+        subnet_source = "client_subnet"
         if client_net is None:
             client_net = copy.deepcopy(global_run_manager.net.module)
             client_net.load_state_dict(base_retrain_state, strict=False)
             client_artifact_path = None
+            subnet_source = "learned_net_fallback"
         client_path = os.path.join(client_path_root, f"client_{idx}")
         os.makedirs(client_path, exist_ok=True)
         client = RunManager(
@@ -286,6 +288,7 @@ def run_supernet_retrain_pipeline(
         client.run_config.search = False
         client.preserve_local_model_for_first_sync = client_artifact_path is not None
         client.personalized_subnet_artifact = client_artifact_path
+        client.personalized_subnet_source = subnet_source
         client.save_config(print_info=False)
         atomic_torch_save(
             {"state_dict": client.net.module.state_dict(), "dataset": client.run_config.dataset},

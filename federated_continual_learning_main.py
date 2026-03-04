@@ -648,6 +648,8 @@ def parse_args() -> argparse.Namespace:
                         help="跳过 warmup 阶段，直接进入 search，用于快速验证")
     parser.add_argument("--skip_search", action="store_true",
                         help="跳过 warmup/search，直接进入 learned_net 重训（要求已有 learned_net/init 和 net.config）")
+    parser.add_argument("--retrain_only", action="store_true",
+                        help="仅执行已固化子网的重训流程，不进入 warmup/search")
     parser.add_argument("--auto_cleanup_warmup_ckpt", dest="auto_cleanup_warmup_ckpt", action="store_true", default=True,
                         help="在当前任务 search 成功结束后自动删除 checkpoint/warmup.pth.tar，默认开启")
     parser.add_argument("--no_auto_cleanup_warmup_ckpt", dest="auto_cleanup_warmup_ckpt", action="store_false",
@@ -1033,8 +1035,14 @@ def main():
             # 仅对首个恢复任务特殊处理，后续任务恢复默认行为
             auto_resume_plan = None
 
-        # 每个任务开始时先恢复 search 阶段的参数配置，避免沿用上轮重训的覆盖值
-        _apply_phase_overrides("search")
+        # 每个任务开始时按执行模式恢复参数配置
+        if args.retrain_only:
+            _apply_phase_overrides("retrain")
+            args.search = False
+            args.skip_warmup = True
+            args.skip_search = True
+        else:
+            _apply_phase_overrides("search")
 
         args.path = base_task_path + f"-task{task_id}"  # 每个任务使用不同的保存路径
         os.makedirs(args.path, exist_ok=True)
@@ -1075,6 +1083,45 @@ def main():
             run_cfg = CifarRunConfig(**args.__dict__ , is_client = True)
             _attach_replay_cfg(run_cfg, args)
             clients_run_config_arr.append(run_cfg)
+
+        if args.retrain_only:
+            print("-----------------------------------------------------retrain only: reuse learned subnets and rerun personalized retrain-----------------------------------------------------")
+            current_task_path = args.path
+            learned_net_path = os.path.join(current_task_path, "learned_net")
+            if args.object_to_search == "supernet":
+                net_config_path = os.path.join(learned_net_path, "net.config")
+                if not os.path.isfile(net_config_path):
+                    raise FileNotFoundError(
+                        f"retrain_only requires existing learned_net/net.config under {learned_net_path}"
+                    )
+                run_supernet_retrain_pipeline(
+                    args=args,
+                    task_id=task_id,
+                    prev_task_path=prev_task_path,
+                    current_task_path=current_task_path,
+                    global_server=None,
+                    clients_run_config_arr=clients_run_config_arr,
+                    replay_buffers_across_tasks=replay_buffers_across_tasks,
+                    runtime_context=runtime_context,
+                    auto_resume_manager=auto_resume_manager,
+                    user_resume=user_resume,
+                    helpers=retrain_helpers,
+                )
+            elif args.object_to_search == "baseline":
+                run_baseline_retrain_pipeline(
+                    args=args,
+                    task_id=task_id,
+                    prev_task_path=prev_task_path,
+                    current_task_path=current_task_path,
+                    replay_buffers_across_tasks=replay_buffers_across_tasks,
+                    runtime_context=runtime_context,
+                    auto_resume_manager=auto_resume_manager,
+                    helpers=retrain_helpers,
+                )
+            else:
+                raise NotImplementedError(f"retrain_only does not support object_to_search={args.object_to_search}")
+            auto_resume_manager.handle_event(task_id, "task_completed", path=args.path)
+            continue
 
         previous_subnet = None
         if task_id > 1:

@@ -218,6 +218,41 @@ def _save_state_safely(state, path: str, desc: str):
     return max(0.0, time.time() - start)
 
 
+def _cleanup_search_checkpoint_files(task_path: str, *, remove_global: bool, remove_warmup: bool):
+    ckpt_dir = os.path.join(task_path, "checkpoint")
+    if not os.path.isdir(ckpt_dir):
+        return []
+    removed = []
+    targets = []
+    if remove_global:
+        targets.append("global.pth.tar")
+    if remove_warmup:
+        targets.append("warmup.pth.tar")
+    for name in targets:
+        path = os.path.join(ckpt_dir, name)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed.append(path)
+            except Exception as e:
+                print(f"[CheckpointCleanup] Failed to remove {path}: {e}")
+    latest_txt = os.path.join(ckpt_dir, "latest.txt")
+    if os.path.isfile(latest_txt):
+        try:
+            with open(latest_txt, "r") as fin:
+                latest_target = fin.readline().strip()
+        except Exception:
+            latest_target = ""
+        if latest_target and any(os.path.abspath(latest_target) == os.path.abspath(p) for p in removed):
+            try:
+                os.remove(latest_txt)
+            except Exception as e:
+                print(f"[CheckpointCleanup] Failed to remove stale latest.txt {latest_txt}: {e}")
+    if removed:
+        print(f"[CheckpointCleanup] Removed {len(removed)} obsolete checkpoint files under {ckpt_dir}")
+    return removed
+
+
 def load_previous_subnet_for_evaluation(learned_net_path: str):
     net_config_path = os.path.join(learned_net_path, "net.config")
     if not os.path.isfile(net_config_path):
@@ -613,6 +648,14 @@ def parse_args() -> argparse.Namespace:
                         help="跳过 warmup 阶段，直接进入 search，用于快速验证")
     parser.add_argument("--skip_search", action="store_true",
                         help="跳过 warmup/search，直接进入 learned_net 重训（要求已有 learned_net/init 和 net.config）")
+    parser.add_argument("--auto_cleanup_warmup_ckpt", dest="auto_cleanup_warmup_ckpt", action="store_true", default=True,
+                        help="在当前任务 search 成功结束后自动删除 checkpoint/warmup.pth.tar，默认开启")
+    parser.add_argument("--no_auto_cleanup_warmup_ckpt", dest="auto_cleanup_warmup_ckpt", action="store_false",
+                        help="关闭当前任务 search 完成后的 warmup checkpoint 自动清理")
+    parser.add_argument("--auto_cleanup_prev_task_search_ckpt", dest="auto_cleanup_prev_task_search_ckpt", action="store_true", default=True,
+                        help="在当前任务 search 成功结束后自动删除上一任务 checkpoint/global.pth.tar 和 warmup.pth.tar，默认开启")
+    parser.add_argument("--no_auto_cleanup_prev_task_search_ckpt", dest="auto_cleanup_prev_task_search_ckpt", action="store_false",
+                        help="关闭上一任务 search checkpoint 自动清理")
 
     # shared hyper-parameters
     parser.add_argument("--arch_init_type", type=str, default="normal", choices=["normal", "uniform"],help="initialization type for architecture parameters")
@@ -1266,6 +1309,10 @@ def main():
                     learned_net_path=os.path.join(args.path, "learned_net"),
                 )
                 print('获取固化网络成功')
+                if args.auto_cleanup_warmup_ckpt:
+                    _cleanup_search_checkpoint_files(args.path, remove_global=False, remove_warmup=True)
+                if args.auto_cleanup_prev_task_search_ckpt and prev_task_path:
+                    _cleanup_search_checkpoint_files(prev_task_path, remove_global=True, remove_warmup=True)
             
             runtime_context.clear_progress_callback()
             

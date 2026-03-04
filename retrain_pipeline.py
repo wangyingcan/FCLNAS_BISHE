@@ -33,6 +33,23 @@ def teacher_is_required(args) -> bool:
     return use_kd_loss
 
 
+def _retrain_total_epochs(args, retrain_last_round: int) -> int:
+    return max(1, int(getattr(args, "local_epoch_number", 1)) * int(retrain_last_round))
+
+
+def _build_retrain_run_config_kwargs(args, retrain_last_round: int):
+    cfg = dict(args.__dict__)
+    cfg["n_epochs"] = _retrain_total_epochs(args, retrain_last_round)
+    cfg["search"] = False
+    return cfg
+
+
+def _prepare_retrain_run_config(run_config: CifarRunConfig, retrain_last_round: int):
+    run_config.search = False
+    run_config.n_epochs = _retrain_total_epochs(run_config, retrain_last_round)
+    return run_config
+
+
 def _reset_run_manager_task(run_mgr: RunManager, new_task_id: int):
     run_mgr.task_id = new_task_id
     run_mgr.run_config.task_id = new_task_id
@@ -141,6 +158,7 @@ def run_supernet_retrain_pipeline(
     args.search = False
     retrain_start_round = args.start_round if args.retrain_start_round is None else args.retrain_start_round
     retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
+    retrain_run_config_kwargs = _build_retrain_run_config_kwargs(args, retrain_last_round)
     retrain_resume_plan = (
         runtime_context.resume_task_plan
         if isinstance(runtime_context.resume_task_plan, dict)
@@ -154,7 +172,7 @@ def run_supernet_retrain_pipeline(
     args.resume = resume_running_stage if retrain_resume_plan is not None else user_resume
 
     args.client_id = 0
-    global_run_config = CifarRunConfig(**args.__dict__, is_client=False)
+    global_run_config = CifarRunConfig(**retrain_run_config_kwargs, is_client=False)
     helpers.attach_replay_cfg(global_run_config, args)
 
     net_config_path = os.path.join(args.path, "net.config")
@@ -258,7 +276,7 @@ def run_supernet_retrain_pipeline(
         client = RunManager(
             client_path,
             client_net,
-            clients_run_config_arr[idx],
+            _prepare_retrain_run_config(clients_run_config_arr[idx], retrain_last_round),
             init_model=False,
             task_id=task_id,
             replay_buffer=replay_buffers_across_tasks[idx],
@@ -480,8 +498,10 @@ def run_baseline_retrain_pipeline(
     helpers: RetrainPipelineHelpers,
 ):
     args.search = False
+    retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
+    retrain_run_config_kwargs = _build_retrain_run_config_kwargs(args, retrain_last_round)
     args.client_id = 0
-    global_run_config = CifarRunConfig(**args.__dict__, is_client=False)
+    global_run_config = CifarRunConfig(**retrain_run_config_kwargs, is_client=False)
     helpers.attach_replay_cfg(global_run_config, args)
     global_net = BaselineResNet(
         arch=args.baseline_arch,
@@ -530,9 +550,11 @@ def run_baseline_retrain_pipeline(
     os.makedirs(client_path_root, exist_ok=True)
     for idx in range(args.num_users):
         args.client_id = idx
-        client_run_config = CifarRunConfig(**args.__dict__, is_client=True)
+        client_run_config_kwargs = dict(retrain_run_config_kwargs)
+        client_run_config_kwargs["client_id"] = idx
+        client_run_config = CifarRunConfig(**client_run_config_kwargs, is_client=True)
         helpers.attach_replay_cfg(client_run_config, args)
-        client_run_config.search = False
+        _prepare_retrain_run_config(client_run_config, retrain_last_round)
         client_net = BaselineResNet(
             arch=args.baseline_arch,
             num_classes=client_run_config.data_provider.n_classes,
@@ -572,7 +594,7 @@ def run_baseline_retrain_pipeline(
         clients_idx_arr=all_client_idx_arr,
         clients=clients,
         start_round=args.retrain_start_round,
-        last_round=args.retrain_last_round,
+        last_round=retrain_last_round,
         path=args.path,
     )
 

@@ -484,6 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_users", type=int, default=10, help="number of clients: K")
     parser.add_argument("--num_tasks", type=int, default=10, help="number of tasks: K")
     parser.add_argument("--start_task_id", type=int, default=1, help="start task id")
+    parser.add_argument("--end_task_id", type=int, default=None, help="end task id for this run; default uses num_tasks")
     parser.add_argument("--object_to_search", type=str, default="supernet",
                         choices=["supernet", "cpu", "gpu8", "flops", "baseline"],
                         help="search target(0:supernet, 1:cpu, 2:gpu8, 3:flops) latency for 1/2 , compute source for 3.")
@@ -941,6 +942,15 @@ def main():
     user_skip_warmup = bool(args.skip_warmup)
     user_skip_search = bool(args.skip_search)
     auto_resume_plan = None
+    effective_end_task_id = args.num_tasks if args.end_task_id is None else int(args.end_task_id)
+    if effective_end_task_id < 1 or effective_end_task_id > int(args.num_tasks):
+        raise ValueError(f"end_task_id must be in [1, {args.num_tasks}], got {effective_end_task_id}")
+    if int(args.start_task_id) < 1 or int(args.start_task_id) > int(args.num_tasks):
+        raise ValueError(f"start_task_id must be in [1, {args.num_tasks}], got {args.start_task_id}")
+    if int(args.start_task_id) > effective_end_task_id:
+        raise ValueError(
+            f"start_task_id ({args.start_task_id}) must be <= end_task_id ({effective_end_task_id})"
+        )
     if args.auto_resume:
         auto_resume_plan = auto_resume_manager.resolve(args.num_tasks, args.object_to_search)
         runtime_context.auto_resume_plan = copy.deepcopy(auto_resume_plan)
@@ -948,13 +958,18 @@ def main():
             print("[AutoResume] 所有任务都已完成，无需继续。")
             return
         args.start_task_id = int(auto_resume_plan["task_id"])
+        if args.start_task_id > effective_end_task_id:
+            print(
+                f"[AutoResume] 恢复起点 task {args.start_task_id} 超出本次执行上限 task {effective_end_task_id}，无需继续。"
+            )
+            return
         print(
             f"[AutoResume] 计划从 task {args.start_task_id} 恢复，"
             f"phase={auto_resume_plan.get('phase')} resume={auto_resume_plan.get('resume', False)}"
         )
 
-    for task_id in range(args.start_task_id, args.num_tasks + 1):
-        print(f"开始执行任务 {task_id}/{args.num_tasks}")
+    for task_id in range(args.start_task_id, effective_end_task_id + 1):
+        print(f"开始执行任务 {task_id} (本次范围: {args.start_task_id}-{effective_end_task_id}, 总任务数: {args.num_tasks})")
         args.task_id = task_id  # 设置当前任务的 task_id
         args.search = True
         args.resume = user_resume

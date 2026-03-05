@@ -33,6 +33,7 @@ class CommonwealthMachine:
             self.writerTf = SummaryWriter(comment=self.hardware + 'fed_retrain')
         else:
             self.writerTf = SummaryWriter(comment='fed_retrain')
+        self._last_test_summary = {}
         print('tensorboardX logdir', self.writerTf.logdir)
         # 非 resume 时清理旧日志，避免跨次运行的 test.log/test_console 累加
         skip_cleanup = getattr(self.config, "skip_retrain_log_cleanup", False)
@@ -410,6 +411,12 @@ class CommonwealthMachine:
             self.writerTf.add_scalar('global_test_loss', avg_test_loss, round)
             self.writerTf.add_scalar('global_test_top1', avg_test_top1, round)
             self.writerTf.add_scalar('global_test_top5', avg_test_top5, round)
+            cur_task_top1 = self._last_test_summary.get("current_task_top1_mean")
+            cur_task_top1_weighted = self._last_test_summary.get("current_task_top1_weighted_mean")
+            if cur_task_top1 is not None:
+                self.writerTf.add_scalar('global_current_task_test_top1', float(cur_task_top1), round)
+            if cur_task_top1_weighted is not None:
+                self.writerTf.add_scalar('global_current_task_test_top1_weighted', float(cur_task_top1_weighted), round)
             evaluation_time += time.time() - evaluation_start
             checkpoint_io_time += self._emit_progress(
                 "retrain_round_completed",
@@ -472,6 +479,13 @@ class CommonwealthMachine:
         per_client_loss = []
         per_client_top5 = []
         per_client_test_weight = []
+        current_task_id = getattr(getattr(self.global_run_manager, "run_config", None), "task_id", None)
+        try:
+            current_task_id = int(current_task_id) if current_task_id is not None else None
+        except Exception:
+            current_task_id = None
+        per_client_current_task_top1 = []
+        per_client_current_task_weight = []
         for idx in self.clients_idx_arr:
             val_loss, val_acc_top1, val_acc_top5 = self.clients[idx].validate(is_test=True, return_top5=True)
             client_losses.update(val_loss)
@@ -482,6 +496,23 @@ class CommonwealthMachine:
             per_client_top5.append(float(val_acc_top5))
             test_weight = int(getattr(self.clients[idx].run_config.data_provider, "tst_set_length", 0))
             per_client_test_weight.append(test_weight)
+            current_task_top1 = None
+            current_task_weight = 0
+            task_acc_map = getattr(self.clients[idx], "last_task_acc", None)
+            task_total_map = getattr(self.clients[idx], "last_task_total", None)
+            if current_task_id is not None and isinstance(task_acc_map, dict):
+                if current_task_id in task_acc_map:
+                    current_task_top1 = float(task_acc_map[current_task_id])
+                else:
+                    current_task_top1 = float(task_acc_map.get(str(current_task_id))) if str(current_task_id) in task_acc_map else None
+            if current_task_id is not None and isinstance(task_total_map, dict):
+                if current_task_id in task_total_map:
+                    current_task_weight = int(task_total_map[current_task_id])
+                elif str(current_task_id) in task_total_map:
+                    current_task_weight = int(task_total_map.get(str(current_task_id), 0))
+            if current_task_top1 is not None:
+                per_client_current_task_top1.append(current_task_top1)
+                per_client_current_task_weight.append(max(0, current_task_weight))
             self._append_per_client_metric(
                 round_idx if round_idx is not None else -1,
                 idx,
@@ -489,6 +520,9 @@ class CommonwealthMachine:
                 test_top1=float(val_acc_top1),
                 test_top5=float(val_acc_top5),
                 test_weight=test_weight,
+                current_task_id=current_task_id,
+                current_task_top1=current_task_top1,
+                current_task_weight=current_task_weight,
             )
             try:
                 self.clients[idx].write_log(
@@ -499,12 +533,26 @@ class CommonwealthMachine:
             except Exception:
                 pass
         prefix_name = tag if tag is not None else self.hardware
-        self.write_log(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] " +
-            "{},test_eval loss {:.4f}, top1 {:.4f}, top5 {:.4f}".format(
-                prefix_name, client_losses.avg, client_top1.avg, client_top5.avg 
+        current_task_msg = ""
+        if per_client_current_task_top1:
+            cur_arr = np.array(per_client_current_task_top1, dtype=np.float64)
+            cur_weight = np.array(per_client_current_task_weight, dtype=np.float64)
+            cur_weighted_mean = float(np.average(cur_arr, weights=cur_weight)) if np.sum(cur_weight) > 0 else float(np.mean(cur_arr))
+            current_task_msg = ", current_task_top1 {:.4f}, current_task_top1_weighted {:.4f}".format(
+                float(np.mean(cur_arr)),
+                cur_weighted_mean,
+            )
+        self.write_log(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+            + "{},test_eval loss {:.4f}, top1 {:.4f}, top5 {:.4f}{}".format(
+                prefix_name,
+                client_losses.avg,
+                client_top1.avg,
+                client_top5.avg,
+                current_task_msg,
             ),
             prefix='test',
-            should_print=True
+            should_print=True,
         )
         if per_client_top1:
             arr_top1 = np.array(per_client_top1, dtype=np.float64)
@@ -521,7 +569,20 @@ class CommonwealthMachine:
                 "test_top1_weighted_mean": weighted_top1,
                 "test_loss_mean": float(np.mean(arr_loss)),
                 "test_top5_mean": float(np.mean(arr_top5)),
+                "current_task_id": current_task_id,
             }
+            if per_client_current_task_top1:
+                cur_arr = np.array(per_client_current_task_top1, dtype=np.float64)
+                cur_weight = np.array(per_client_current_task_weight, dtype=np.float64)
+                stats_record["current_task_top1_mean"] = float(np.mean(cur_arr))
+                stats_record["current_task_top1_std"] = float(np.std(cur_arr))
+                stats_record["current_task_top1_min"] = float(np.min(cur_arr))
+                stats_record["current_task_top1_max"] = float(np.max(cur_arr))
+                stats_record["current_task_top1_weighted_mean"] = (
+                    float(np.average(cur_arr, weights=cur_weight))
+                    if np.sum(cur_weight) > 0
+                    else float(np.mean(cur_arr))
+                )
             self._append_test_top1_stats(
                 round_idx if round_idx is not None else -1,
                 prefix_name,
@@ -539,6 +600,21 @@ class CommonwealthMachine:
                 prefix='test',
                 should_print=True,
             )
+            if "current_task_top1_mean" in stats_record:
+                self.write_log(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                    + "current_task(T{})_top1_stats mean {:.4f}, std {:.4f}, min {:.4f}, max {:.4f}, weighted_mean {:.4f}".format(
+                        int(stats_record["current_task_id"]),
+                        stats_record["current_task_top1_mean"],
+                        stats_record["current_task_top1_std"],
+                        stats_record["current_task_top1_min"],
+                        stats_record["current_task_top1_max"],
+                        stats_record["current_task_top1_weighted_mean"],
+                    ),
+                    prefix='test',
+                    should_print=True,
+                )
+            self._last_test_summary = stats_record
         return client_losses.avg, client_top1.avg, client_top5.avg
 
     

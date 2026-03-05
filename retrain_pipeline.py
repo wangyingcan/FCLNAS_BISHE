@@ -186,6 +186,32 @@ def _configure_baseline_method(args):
     return method
 
 
+def _configure_supernet_retrain_replay(args, task_id: int):
+    """
+    NAS 子网重训默认启用历史样本回放（task>1），避免忘记显式传参导致无回放。
+    若用户已手动指定 replay 参数，则尊重用户配置。
+    """
+    if int(task_id) <= 1:
+        return
+    if bool(getattr(args, "enable_replay", False)):
+        return
+
+    args.enable_replay = True
+    if str(getattr(args, "replay_mode", "none")).lower() == "none":
+        args.replay_mode = "task_balanced"
+    if int(getattr(args, "replay_per_batch", 0)) <= 0:
+        train_bs = int(getattr(args, "train_batch_size", 128))
+        args.replay_per_batch = max(16, min(64, train_bs // 4))
+    if int(getattr(args, "replay_capacity", 0)) <= 0 and getattr(args, "replay_capacity_ratio", None) is None:
+        args.replay_capacity_ratio = 0.1
+    print(
+        "[RetrainReplay] auto-enable replay for NAS retrain: "
+        f"mode={args.replay_mode}, per_batch={args.replay_per_batch}, "
+        f"capacity={getattr(args, 'replay_capacity', 0)}, "
+        f"capacity_ratio={getattr(args, 'replay_capacity_ratio', None)}"
+    )
+
+
 def run_supernet_retrain_pipeline(
     args,
     task_id: int,
@@ -199,6 +225,8 @@ def run_supernet_retrain_pipeline(
     user_resume: bool,
     helpers: RetrainPipelineHelpers,
 ):
+    _configure_supernet_retrain_replay(args, task_id)
+
     retrain_path = os.path.join(current_task_path, "learned_net")
     if args.skip_search and not os.path.exists(os.path.join(retrain_path, "net.config")):
         os.makedirs(retrain_path, exist_ok=True)

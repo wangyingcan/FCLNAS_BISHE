@@ -412,6 +412,8 @@ class RunManager:
         self.round = 0
         # 最近一次测试的分任务精度，用于上层日志/遗忘分析
         self.last_task_acc = None
+        # 最近一次测试的分任务样本量，便于按当前任务加权统计
+        self.last_task_total = None
         # 历史最佳分任务精度，便于计算遗忘 F
         self.best_task_acc = {}
         # 当前用于经验回放的遗忘表
@@ -1376,6 +1378,7 @@ class RunManager:
                 t: (per_task_correct.get(t, 0) * 100.0 / per_task_total[t])
                 for t in per_task_total
             }
+            self.last_task_total = {t: int(per_task_total[t]) for t in per_task_total}
             log_str = "per_task_test_top1: " + ", ".join(
                 [f"T{t}:{acc:.2f}" for t, acc in sorted(self.last_task_acc.items())]
             )
@@ -1394,6 +1397,7 @@ class RunManager:
             self.task_forgetting = f_dict
         else:
             self.last_task_acc = None
+            self.last_task_total = None
 
         if return_top5:
             return losses.avg, top1.avg, top5.avg
@@ -1404,6 +1408,7 @@ class RunManager:
         """清空遗忘统计，使后续任务重新累计偏置。"""
         self.best_task_acc = {}
         self.last_task_acc = None
+        self.last_task_total = None
         self.task_forgetting = {}
         self._class_to_task_cache = None
 

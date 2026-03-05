@@ -871,19 +871,32 @@ def main():
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.enabled = True
 
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu   # 设置程序可见的gpu环境变量
+
     # 随机种子
     torch.manual_seed(args.manual_seed)
-    torch.cuda.manual_seed_all(args.manual_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.manual_seed)
     np.random.seed(args.manual_seed)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu   # 设置程序可见的gpu环境变量
-    
-    pynvml.nvmlInit()
-    # 获取当前进程使用的 GPU 的 UUID
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # 逻辑 GPU 0
-    uuid = pynvml.nvmlDeviceGetUUID(handle)
-
-    print(">>> 实际使用的物理 GPU UUID:", uuid)
+    try:
+        pynvml.nvmlInit()
+        # 获取当前进程使用的 GPU 的 UUID（逻辑 GPU 0）
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        uuid = pynvml.nvmlDeviceGetUUID(handle)
+        print(">>> 实际使用的物理 GPU UUID:", uuid)
+    except Exception as e:
+        # NVML 在共享/异常驱动环境下可能失败，不应阻断训练主流程
+        print(f">>> NVML unavailable, skip UUID probing: {e}")
+        try:
+            print(f">>> torch visible cuda count: {torch.cuda.device_count()}")
+        except Exception:
+            pass
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
 
     # 跨任务共享的 replay buffer（按 client 索引），避免每个任务重建导致忘记旧样本
     replay_buffers_across_tasks = [None for _ in range(args.num_users)]

@@ -77,6 +77,14 @@ class GradientArchSearchConfig(ArchSearchConfig):
         grad_data_batch=None,
         grad_reg_loss_type=None,
         grad_reg_loss_params=None,
+        grad_meta_enable=False,
+        grad_meta_noise_ratio=0.3,
+        grad_meta_noise_std=0.15,
+        grad_meta_inner_lr=-1.0,
+        grad_meta_fd_epsilon=0.01,
+        grad_meta_second_order=True,
+        grad_meta_real_weight_update=True,
+        grad_meta_replay_per_batch=0,
         **kwargs,
     ):
         super(GradientArchSearchConfig, self).__init__(
@@ -99,6 +107,15 @@ class GradientArchSearchConfig(ArchSearchConfig):
         self.reg_loss_params = (
             {} if grad_reg_loss_params is None else grad_reg_loss_params
         )
+        # 元学习驱动的架构更新（可选）
+        self.meta_enable = bool(grad_meta_enable)
+        self.meta_noise_ratio = float(grad_meta_noise_ratio)
+        self.meta_noise_std = float(grad_meta_noise_std)
+        self.meta_inner_lr = float(grad_meta_inner_lr)
+        self.meta_fd_epsilon = float(grad_meta_fd_epsilon)
+        self.meta_second_order = bool(grad_meta_second_order)
+        self.meta_real_weight_update = bool(grad_meta_real_weight_update)
+        self.meta_replay_per_batch = int(grad_meta_replay_per_batch)
 
         # logging.info(kwargs.keys())
 
@@ -657,6 +674,9 @@ class ArchSearchRunManager:
             None,
             None,
         )
+        use_meta_grad = isinstance(self.arch_search_config, GradientArchSearchConfig) and bool(
+            getattr(self.arch_search_config, "meta_enable", False)
+        )
 
         for epoch in range(start_local_epoch, last_local_epoch):
             batch_time = AverageMeter()
@@ -677,51 +697,69 @@ class ArchSearchRunManager:
                 net_entropy = self.net.entropy()
                 entropy.update(net_entropy.data.item() / arch_param_num, 1)
                 # train weight parameters if not fix_net_weights
+                images_cuda, labels_cuda = None, None
                 if not fix_net_weights:
-                    images, labels = images.cuda(non_blocking=True), labels.cuda(
+                    images_cuda, labels_cuda = images.cuda(non_blocking=True), labels.cuda(
                         non_blocking=True
                     )
-
-                    self.net.reset_binary_gates()  # random sample binary gates
-                    self.net.unused_modules_off()  # remove unused module for speedup
-                    output = self.run_manager.net(images)
-
-                    if self.run_manager.run_config.label_smoothing > 0:
-                        total_loss = cross_entropy_with_label_smoothing(
-                            output, labels, self.run_manager.run_config.label_smoothing
-                        )
+                    if use_meta_grad and epoch > 0 and update_schedule.get(i, 0) > 0:
+                        meta_steps = update_schedule.get(i, 0)
+                        real_train_loss, real_acc1, real_acc5 = None, None, None
+                        for _ in range(meta_steps):
+                            _, _, real_train_loss, real_acc1, real_acc5 = self.gradient_step_meta(
+                                images_cuda, labels_cuda
+                            )
+                        if real_train_loss is not None:
+                            losses.update(real_train_loss, images_cuda.size(0))
+                        if real_acc1 is not None:
+                            top1.update(real_acc1, images_cuda.size(0))
+                        if real_acc5 is not None:
+                            top5.update(real_acc5, images_cuda.size(0))
                     else:
-                        total_loss = self.run_manager.criterion(output, labels)
+                        self.net.reset_binary_gates()  # random sample binary gates
+                        self.net.unused_modules_off()  # remove unused module for speedup
+                        output = self.run_manager.net(images_cuda)
 
-                    acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-                    losses.update(total_loss.item(), images.size(0))
-                    top1.update(acc1[0].item(), images.size(0))
-                    top5.update(acc5[0].item(), images.size(0))
+                        if self.run_manager.run_config.label_smoothing > 0:
+                            total_loss = cross_entropy_with_label_smoothing(
+                                output, labels_cuda, self.run_manager.run_config.label_smoothing
+                            )
+                        else:
+                            total_loss = self.run_manager.criterion(output, labels_cuda)
 
-                    self.run_manager.net.zero_grad()
-                    total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
-                    self.run_manager.optimizer.step()
-                    self.net.unused_modules_back()
+                        acc1, acc5 = accuracy(output, labels_cuda, topk=(1, 5))
+                        losses.update(total_loss.item(), images_cuda.size(0))
+                        top1.update(acc1[0].item(), images_cuda.size(0))
+                        top5.update(acc5[0].item(), images_cuda.size(0))
+
+                        self.run_manager.net.zero_grad()
+                        total_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
+                        self.run_manager.optimizer.step()
+                        self.net.unused_modules_back()
 
                 # skip architecture parameter updates in the first epoch
                 if epoch > 0:
+                    if use_meta_grad and not fix_net_weights:
+                        # 元学习模式已在上面的 gradient_step_meta 中完成 alpha 更新
+                        pass
                     # update architecture parameters according to update_schedule
-                    for j in range(update_schedule.get(i, 0)):
-                        # ---- 强化学习更新 ----
-                        if isinstance(self.arch_search_config, RLArchSearchConfig):
-                            self.rl_update_step(fast=True)
+                    else:
+                        for j in range(update_schedule.get(i, 0)):
+                            # ---- 强化学习更新 ----
+                            if isinstance(self.arch_search_config, RLArchSearchConfig):
+                                self.rl_update_step(fast=True)
 
-                        # ---- 梯度更新 ----
-                        elif isinstance(
-                            self.arch_search_config, GradientArchSearchConfig
-                        ):
-                            self.gradient_step()
+                            # ---- 梯度更新 ----
+                            elif isinstance(
+                                self.arch_search_config, GradientArchSearchConfig
+                            ):
+                                self.gradient_step()
 
-                        else:
-                            raise ValueError(
-                                "do not support: %s" % type(self.arch_search_config)
-                            )
+                            else:
+                                raise ValueError(
+                                    "do not support: %s" % type(self.arch_search_config)
+                                )
                 self.local_train_losses.update(losses.avg)
                 self.local_train_top1.update(top1.avg)
                 # measure elapsed time
@@ -846,6 +884,257 @@ class ArchSearchRunManager:
         # apply gradients
         self.arch_optimizer.step()
 
+    def _compute_train_ce_loss(self, output, labels):
+        if self.run_manager.run_config.label_smoothing > 0:
+            return cross_entropy_with_label_smoothing(
+                output, labels, self.run_manager.run_config.label_smoothing
+            )
+        return self.run_manager.criterion(output, labels)
+
+    def _compute_expected_hardware_value(self):
+        if self.arch_search_config.target_hardware is None:
+            return None
+        if self.arch_search_config.target_hardware in ["mobile", "cpu", "gpu8"]:
+            return self.net.expected_latency()
+        if self.arch_search_config.target_hardware == "supernet":
+            return None
+        if self.arch_search_config.target_hardware == "flops":
+            data_shape = [1] + list(self.run_manager.run_config.data_provider.data_shape)
+            input_var = torch.zeros(data_shape, device=self.run_manager.device)
+            return self.net.expected_flops(input_var)
+        raise NotImplementedError
+
+    @staticmethod
+    def _add_gaussian_noise(images, noise_ratio: float, noise_std: float):
+        if noise_ratio <= 0 or noise_std <= 0:
+            return images
+        bsz = images.size(0)
+        if bsz <= 0:
+            return images
+        k = int(round(bsz * min(max(noise_ratio, 0.0), 1.0)))
+        if k <= 0:
+            return images
+        noised = images.clone()
+        idx = torch.randperm(bsz, device=images.device)[:k]
+        noised[idx] = noised[idx] + torch.randn_like(noised[idx]) * noise_std
+        return noised
+
+    def _compute_arch_grad_on_train_batch(self, train_images, train_labels, seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        self.run_manager.net.zero_grad()
+        self.net.reset_binary_gates()
+        self.net.unused_modules_off()
+        output = self.run_manager.net(train_images)
+        loss = self._compute_train_ce_loss(output, train_labels)
+        loss.backward()
+        self.net.set_arch_param_grad()
+        arch_grads = []
+        for p in self.net.architecture_parameters():
+            if p.grad is None:
+                arch_grads.append(torch.zeros_like(p))
+            else:
+                arch_grads.append(p.grad.detach().clone())
+        self.net.unused_modules_back()
+        self.run_manager.net.zero_grad()
+        return arch_grads
+
+    def gradient_step_meta(self, train_images, train_labels):
+        """
+        元学习驱动的架构更新：
+        1) 内层：在 meta-train 上做权重虚拟更新得到 W'
+        2) 外层：在加噪 meta-val 上计算对 alpha 的元梯度（含有限差分二阶项）
+        3) 真实：更新 alpha 后，再在同一 meta-train batch 上真实更新一次 W
+        """
+        assert isinstance(self.arch_search_config, GradientArchSearchConfig)
+        cfg = self.arch_search_config
+
+        if cfg.data_batch is None:
+            self.run_manager.run_config.valid_loader.batch_sampler.batch_size = (
+                self.run_manager.run_config.train_batch_size
+            )
+        else:
+            self.run_manager.run_config.valid_loader.batch_sampler.batch_size = cfg.data_batch
+        self.run_manager.run_config.valid_loader.batch_sampler.drop_last = True
+
+        self.run_manager.net.train()
+        MixedEdge.MODE = cfg.binary_mode
+
+        weight_params = [p for p in self.net.weight_parameters() if p.requires_grad]
+        arch_params = [p for p in self.net.architecture_parameters() if p.requires_grad]
+        if len(weight_params) == 0 or len(arch_params) == 0:
+            # 防御分支：参数异常时回退到原始 gradient_step
+            base_loss, base_expected = self.gradient_step()
+            return base_loss, base_expected, None, None, None
+
+        inner_lr = float(cfg.meta_inner_lr)
+        if inner_lr <= 0:
+            try:
+                inner_lr = float(self.run_manager.optimizer.param_groups[0]["lr"])
+            except Exception:
+                inner_lr = float(self.run_manager.run_config.init_lr)
+
+        # 可选：拼接回放样本构建 D_pool 的 meta-train batch
+        meta_train_images = train_images
+        meta_train_labels = train_labels
+        replay_k = max(0, int(getattr(cfg, "meta_replay_per_batch", 0)))
+        replay_buffer = getattr(self.run_manager, "replay_buffer", None)
+        if replay_k > 0 and replay_buffer is not None and len(replay_buffer) > 0:
+            rep_x, rep_y = replay_buffer.sample(
+                replay_k, mode="global", exclude_task=self.task_id
+            )
+            if rep_x is not None and rep_y is not None:
+                rep_x = rep_x.to(train_images.device, non_blocking=True)
+                rep_y = rep_y.to(train_labels.device, non_blocking=True)
+                meta_train_images = torch.cat([train_images, rep_x], dim=0)
+                meta_train_labels = torch.cat([train_labels, rep_y], dim=0)
+
+        # Step A: 内层虚拟更新 W -> W'
+        self.run_manager.net.zero_grad()
+        self.net.reset_binary_gates()
+        self.net.unused_modules_off()
+        inner_output = self.run_manager.net(meta_train_images)
+        inner_loss = self._compute_train_ce_loss(inner_output, meta_train_labels)
+        inner_grads = torch.autograd.grad(
+            inner_loss, weight_params, create_graph=False, allow_unused=True
+        )
+        self.net.unused_modules_back()
+        with torch.no_grad():
+            for p, g in zip(weight_params, inner_grads):
+                if g is not None:
+                    p.add_(-inner_lr * g)
+
+        # Step B: 外层在加噪 meta-val 上计算直接梯度与 v=∇_{W'}L_val
+        images_val, labels_val = self.run_manager.run_config.valid_next_batch
+        images_val = images_val.cuda(non_blocking=True)
+        labels_val = labels_val.cuda(non_blocking=True)
+        images_val = self._add_gaussian_noise(
+            images_val, cfg.meta_noise_ratio, cfg.meta_noise_std
+        )
+
+        self.run_manager.net.zero_grad()
+        self.net.reset_binary_gates()
+        self.net.unused_modules_off()
+        output_val = self.run_manager.net(images_val)
+        ce_loss_val = self.run_manager.criterion(output_val, labels_val)
+        expected_value = self._compute_expected_hardware_value()
+        outer_loss = self.arch_search_config.add_regularization_loss(
+            ce_loss_val, expected_value
+        )
+        prior_penalty_value = 0.0
+        if bool(getattr(self, "arch_prior_regularization_enabled", False)):
+            target_arch_params = getattr(self, "arch_prior_regularization_target", None)
+            lambda_value = float(getattr(self, "arch_prior_regularization_lambda", 0.0))
+            if lambda_value > 0 and target_arch_params:
+                prior_penalty = compute_arch_prior_penalty(self.net, target_arch_params)
+                if prior_penalty is not None:
+                    outer_loss = outer_loss + lambda_value * prior_penalty
+                    prior_penalty_value = float(prior_penalty.detach().item())
+        self.arch_prior_penalty.update(prior_penalty_value, 1)
+        self.arch_prior_penalty_last = prior_penalty_value
+
+        outer_loss.backward()
+        self.net.set_arch_param_grad()
+        direct_arch_grads = []
+        for p in arch_params:
+            if p.grad is None:
+                direct_arch_grads.append(torch.zeros_like(p))
+            else:
+                direct_arch_grads.append(p.grad.detach().clone())
+        val_weight_grads = []
+        for p in weight_params:
+            if p.grad is None:
+                val_weight_grads.append(None)
+            else:
+                val_weight_grads.append(p.grad.detach().clone())
+        self.net.unused_modules_back()
+        self.run_manager.net.zero_grad()
+
+        # 恢复原始权重 W（撤销虚拟更新）
+        with torch.no_grad():
+            for p, g in zip(weight_params, inner_grads):
+                if g is not None:
+                    p.add_(inner_lr * g)
+
+        # Step C: 有限差分近似二阶项（可开关）
+        hessian_arch_grads = [torch.zeros_like(g) for g in direct_arch_grads]
+        if bool(cfg.meta_second_order):
+            flat_v = [v.reshape(-1) for v in val_weight_grads if v is not None]
+            if len(flat_v) > 0:
+                v_norm = torch.cat(flat_v).norm().item()
+            else:
+                v_norm = 0.0
+            if v_norm > 0:
+                epsilon_base = max(float(cfg.meta_fd_epsilon), 1e-8)
+                epsilon = epsilon_base / (v_norm + 1e-12)
+                seed = torch.randint(0, 2**31 - 1, (1,), device=train_images.device).item()
+
+                with torch.no_grad():
+                    for p, v in zip(weight_params, val_weight_grads):
+                        if v is not None:
+                            p.add_(epsilon * v)
+                grad_alpha_plus = self._compute_arch_grad_on_train_batch(
+                    meta_train_images, meta_train_labels, seed=seed
+                )
+
+                with torch.no_grad():
+                    for p, v in zip(weight_params, val_weight_grads):
+                        if v is not None:
+                            p.add_(-2.0 * epsilon * v)
+                grad_alpha_minus = self._compute_arch_grad_on_train_batch(
+                    meta_train_images, meta_train_labels, seed=seed
+                )
+
+                with torch.no_grad():
+                    for p, v in zip(weight_params, val_weight_grads):
+                        if v is not None:
+                            p.add_(epsilon * v)
+
+                hessian_arch_grads = [
+                    (g_p - g_m) / (2.0 * epsilon)
+                    for g_p, g_m in zip(grad_alpha_plus, grad_alpha_minus)
+                ]
+
+        # Step D: 组装元梯度并更新 alpha
+        self.run_manager.net.zero_grad()
+        for p, g_direct, g_hessian in zip(
+            arch_params, direct_arch_grads, hessian_arch_grads
+        ):
+            p.grad = g_direct - inner_lr * g_hessian
+        self.arch_optimizer.step()
+        if MixedEdge.MODE == "two":
+            self.net.rescale_updated_arch_param()
+
+        # Step E: 在同一 meta-train batch 上真实更新一次 W
+        real_train_loss = None
+        real_acc1 = None
+        real_acc5 = None
+        if bool(cfg.meta_real_weight_update):
+            self.run_manager.net.zero_grad()
+            self.net.reset_binary_gates()
+            self.net.unused_modules_off()
+            output_train_real = self.run_manager.net(meta_train_images)
+            total_loss = self._compute_train_ce_loss(output_train_real, meta_train_labels)
+            acc1, acc5 = accuracy(output_train_real, meta_train_labels, topk=(1, 5))
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.run_manager.net.parameters(), max_norm=5.0)
+            self.run_manager.optimizer.step()
+            self.net.unused_modules_back()
+            real_train_loss = float(total_loss.detach().item())
+            real_acc1 = float(acc1[0].item())
+            real_acc5 = float(acc5[0].item())
+
+        MixedEdge.MODE = None
+        return (
+            float(outer_loss.detach().item()),
+            expected_value.item() if expected_value is not None else None,
+            real_train_loss,
+            real_acc1,
+            real_acc5,
+        )
+
     def gradient_step(
         self,
     ):
@@ -875,25 +1164,7 @@ class ArchSearchRunManager:
         time3 = time.time()  # time
         # loss
         ce_loss = self.run_manager.criterion(output, labels)
-        if self.arch_search_config.target_hardware is None:
-            expected_value = None
-        elif self.arch_search_config.target_hardware == "mobile":
-            expected_value = self.net.expected_latency()
-        elif self.arch_search_config.target_hardware == "cpu":
-            expected_value = self.net.expected_latency()
-            # logging.info('cpu latency:', expected_value)
-        elif self.arch_search_config.target_hardware == "gpu8":
-            expected_value = self.net.expected_latency()
-        elif self.arch_search_config.target_hardware == "supernet":
-            expected_value = None
-        elif self.arch_search_config.target_hardware == "flops":
-            data_shape = [1] + list(
-                self.run_manager.run_config.data_provider.data_shape
-            )
-            input_var = torch.zeros(data_shape, device=self.run_manager.device)
-            expected_value = self.net.expected_flops(input_var)
-        else:
-            raise NotImplementedError
+        expected_value = self._compute_expected_hardware_value()
         loss = self.arch_search_config.add_regularization_loss(ce_loss, expected_value)
         prior_penalty_value = 0.0
         if bool(getattr(self, "arch_prior_regularization_enabled", False)):

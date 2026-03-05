@@ -622,6 +622,18 @@ def parse_args() -> argparse.Namespace:
                         help="是否在子网重训阶段启用 replay 模块，默认关闭")
     parser.add_argument("--enable_kd", action="store_true",
                         help="是否在子网重训阶段启用 logit KD 模块，默认关闭")
+    parser.add_argument("--retrain_meta_enable", type=parse_optional_bool, nargs="?", const=True, default=False,
+                        help="在子网重训阶段启用支持集/查询集元学习更新（first-order）")
+    parser.add_argument("--retrain_meta_support_ratio", type=float, default=0.5,
+                        help="元学习内层支持集比例（0~1），其余样本作为查询集")
+    parser.add_argument("--retrain_meta_inner_lr", type=float, default=-1.0,
+                        help="元学习内层虚拟更新学习率；<=0 时自动使用当前权重学习率")
+    parser.add_argument("--retrain_meta_noise_ratio", type=float, default=0.0,
+                        help="查询集中加入高斯噪声的样本比例（0~1）")
+    parser.add_argument("--retrain_meta_noise_std", type=float, default=0.0,
+                        help="查询集高斯噪声标准差，<=0 表示不加噪")
+    parser.add_argument("--retrain_meta_use_kd", type=parse_optional_bool, nargs="?", const=True, default=True,
+                        help="元学习更新时是否保留 KD 项（当 enable_kd 且 teacher 可用时生效）")
     
     
     # 分阶段可选覆盖：当前仅保留 retrain_*；search 阶段的遗忘相关覆盖已停用
@@ -750,6 +762,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad_reg_loss_lambda", type=float, default=0.05, help="regularization loss lambda")
     parser.add_argument("--grad_reg_loss_alpha", type=float, default=0.2, help="regularization loss alpha")
     parser.add_argument("--grad_reg_loss_beta", type=float, default=0.3, help="regularization loss beta")
+    parser.add_argument("--grad_meta_enable", type=parse_optional_bool, nargs="?", const=True, default=False,
+                        help="启用元学习驱动的 grad-search（内层虚拟更新 + 外层元评估）")
+    parser.add_argument("--grad_meta_noise_ratio", type=float, default=0.3,
+                        help="元验证 batch 中加噪样本比例（0~1）")
+    parser.add_argument("--grad_meta_noise_std", type=float, default=0.15,
+                        help="元验证加噪的高斯噪声标准差")
+    parser.add_argument("--grad_meta_inner_lr", type=float, default=-1.0,
+                        help="内层虚拟更新学习率 ξ；<=0 时自动使用当前权重学习率")
+    parser.add_argument("--grad_meta_fd_epsilon", type=float, default=0.01,
+                        help="有限差分基准扰动系数 ε（实际扰动为 ε/||v||）")
+    parser.add_argument("--grad_meta_second_order", type=parse_optional_bool, nargs="?", const=True, default=True,
+                        help="是否启用有限差分二阶近似项（混合 Hessian）")
+    parser.add_argument("--grad_meta_real_weight_update", type=parse_optional_bool, nargs="?", const=True, default=True,
+                        help="外层更新 alpha 后，是否在同一 meta-train batch 上执行真实权重更新")
+    parser.add_argument("--grad_meta_replay_per_batch", type=int, default=0,
+                        help="元训练批次额外拼接的回放样本数（>0 且存在 replay_buffer 时生效）")
 
     # RL hyper-parameters
     parser.add_argument("--rl_batch_size", type=int, default=10, help="batch size to sample architectures and compute rewards")
@@ -864,7 +892,19 @@ def main():
             
     def _attach_replay_cfg(run_cfg, a):
         """将回放相关超参挂到 run_config 上，便于 RunManager 读取；支持按全训练集比例设定容量。"""
-        for k in ["replay_mode", "replay_capacity", "replay_per_batch", "replay_old_task_scale", "replay_old_task_scale_by_F"]:
+        for k in [
+            "replay_mode",
+            "replay_capacity",
+            "replay_per_batch",
+            "replay_old_task_scale",
+            "replay_old_task_scale_by_F",
+            "retrain_meta_enable",
+            "retrain_meta_support_ratio",
+            "retrain_meta_inner_lr",
+            "retrain_meta_noise_ratio",
+            "retrain_meta_noise_std",
+            "retrain_meta_use_kd",
+        ]:
             setattr(run_cfg, k, getattr(a, k, None))
         ratio = getattr(a, "replay_capacity_ratio", None)
         if ratio is not None:
@@ -1381,7 +1421,7 @@ def main():
                 args.path, local_client_super_net,
                 clients_run_config_arr[idx], asc_local, task_id=args.task_id,
                 init_model=not inherited_supernet,
-                replay_buffer=None,
+                replay_buffer=replay_buffers_across_tasks[idx],
             )
             _attach_replay_cfg(client.run_manager.run_config, args)
             clients.append(client)

@@ -497,6 +497,24 @@ class RunManager:
         # Ditto 等个性化方法可选的 proximal 正则上下文（按轮注入，默认关闭）
         self._prox_reference_state = None
         self._prox_mu = 0.0
+        # 子网重训阶段可选：support/query 的 first-order 元学习更新
+        self.retrain_meta_enable = bool(getattr(run_config, "retrain_meta_enable", False)) and (
+            self.run_phase == "personalized_subnet_retrain"
+        )
+        self.retrain_meta_support_ratio = float(getattr(run_config, "retrain_meta_support_ratio", 0.5))
+        self.retrain_meta_inner_lr = float(getattr(run_config, "retrain_meta_inner_lr", -1.0))
+        self.retrain_meta_noise_ratio = float(getattr(run_config, "retrain_meta_noise_ratio", 0.0))
+        self.retrain_meta_noise_std = float(getattr(run_config, "retrain_meta_noise_std", 0.0))
+        self.retrain_meta_use_kd = bool(getattr(run_config, "retrain_meta_use_kd", True))
+        if self.retrain_meta_enable:
+            print(
+                "[RetrainMeta] enable=True "
+                f"support_ratio={self.retrain_meta_support_ratio:.3f} "
+                f"inner_lr={self.retrain_meta_inner_lr:.6f} "
+                f"noise_ratio={self.retrain_meta_noise_ratio:.3f} "
+                f"noise_std={self.retrain_meta_noise_std:.4f} "
+                f"use_kd={self.retrain_meta_use_kd}"
+            )
 
     def load_ewc_state(self, state):
         """加载外部保存的 EWC 状态；state=None 时重置。"""
@@ -1444,6 +1462,182 @@ class RunManager:
                 break
             yield rep_x.to(self.device, non_blocking=True), rep_y.to(self.device, non_blocking=True)
 
+    def _compute_ce_loss(self, output, labels):
+        if not torch.isfinite(output).all():
+            output = torch.nan_to_num(output, nan=0.0, posinf=1e4, neginf=-1e4)
+        if self.run_config.label_smoothing > 0:
+            ce_loss = cross_entropy_with_label_smoothing(
+                output, labels, self.run_config.label_smoothing
+            )
+        else:
+            ce_loss = self.criterion(output, labels)
+        if not torch.isfinite(ce_loss):
+            ce_loss = output.sum() * 0.0
+        return ce_loss, output
+
+    def _compute_kd_loss(self, student_output, images):
+        if (
+            not self.enable_kd
+            or self.teacher_model is None
+            or self.cl_kd_logit_lambda <= 0
+            or self.cl_kd_method not in ["logit", "logit_conf"]
+        ):
+            return None
+        with torch.no_grad():
+            teacher_out = self.teacher_model(images)
+            if not torch.isfinite(teacher_out).all():
+                teacher_out = torch.nan_to_num(
+                    teacher_out, nan=0.0, posinf=1e4, neginf=-1e4
+                )
+        T = self.cl_kd_temperature if self.cl_kd_temperature > 0 else 1.0
+        student_log_probs = F.log_softmax(student_output / T, dim=1)
+        teacher_probs = F.softmax(teacher_out / T, dim=1)
+        if self.cl_kd_method == "logit":
+            return F.kl_div(
+                student_log_probs, teacher_probs, reduction="batchmean"
+            ) * (T * T)
+        mask = (teacher_probs > self.cl_kd_conf_threshold).float()
+        if mask.sum() <= 0:
+            return None
+        log_teacher = torch.log(teacher_probs + 1e-12)
+        kl_elem = (teacher_probs * (log_teacher - student_log_probs)) * mask
+        return (kl_elem.sum() / mask.sum()) * (T * T)
+
+    def _compose_total_loss(
+        self,
+        output,
+        labels,
+        images,
+        include_kd=True,
+        include_prox=True,
+    ):
+        ce_loss, output = self._compute_ce_loss(output, labels)
+        kd_loss = self._compute_kd_loss(output, images) if include_kd else None
+        total_loss = ce_loss
+        if kd_loss is not None:
+            total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
+        if include_prox and self._prox_mu > 0 and self._prox_reference_state:
+            prox_penalty = torch.zeros(1, device=self.device)
+            for name, p in self.net.module.named_parameters():
+                ref = self._prox_reference_state.get(name)
+                if ref is None:
+                    continue
+                prox_penalty = prox_penalty + torch.sum((p - ref) ** 2)
+            total_loss = total_loss + 0.5 * self._prox_mu * prox_penalty
+        if not torch.isfinite(total_loss):
+            total_loss = output.sum() * 0.0
+        return total_loss, ce_loss, kd_loss, output
+
+    @staticmethod
+    def _add_gaussian_noise(images, noise_ratio: float, noise_std: float):
+        if noise_ratio <= 0 or noise_std <= 0:
+            return images
+        bsz = images.size(0)
+        if bsz <= 0:
+            return images
+        k = int(round(bsz * min(max(noise_ratio, 0.0), 1.0)))
+        if k <= 0:
+            return images
+        noised = images.clone()
+        idx = torch.randperm(bsz, device=images.device)[:k]
+        noised[idx] = noised[idx] + torch.randn_like(noised[idx]) * noise_std
+        return noised
+
+    def _split_support_query_batch(self, images, labels):
+        bsz = int(images.size(0))
+        if bsz < 2:
+            return None
+        ratio = min(max(float(self.retrain_meta_support_ratio), 0.05), 0.95)
+        support_size = int(round(bsz * ratio))
+        support_size = min(max(1, support_size), bsz - 1)
+        perm = torch.randperm(bsz, device=images.device)
+        support_idx = perm[:support_size]
+        query_idx = perm[support_size:]
+        if query_idx.numel() <= 0:
+            return None
+        return (
+            images[support_idx],
+            labels[support_idx],
+            images[query_idx],
+            labels[query_idx],
+        )
+
+    def _standard_train_step(self, images, labels):
+        self.optimizer.zero_grad()
+        self.net.zero_grad()
+        output = self.net(images)
+        total_loss, _, _, output = self._compose_total_loss(
+            output,
+            labels,
+            images,
+            include_kd=True,
+            include_prox=True,
+        )
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
+        self.optimizer.step()
+        return output.detach(), labels, total_loss.detach()
+
+    def _meta_train_step(self, images, labels, current_lr):
+        if not self.retrain_meta_enable:
+            return None
+        split = self._split_support_query_batch(images, labels)
+        if split is None:
+            return None
+        support_images, support_labels, query_images, query_labels = split
+        query_images = self._add_gaussian_noise(
+            query_images,
+            self.retrain_meta_noise_ratio,
+            self.retrain_meta_noise_std,
+        )
+        inner_lr = float(self.retrain_meta_inner_lr)
+        if inner_lr <= 0:
+            if current_lr is not None:
+                inner_lr = float(current_lr)
+            else:
+                inner_lr = float(self.optimizer.param_groups[0]["lr"])
+        params = [p for p in self.net.module.parameters() if p.requires_grad]
+        if len(params) == 0:
+            return None
+        backup = [p.detach().clone() for p in params]
+        self.optimizer.zero_grad()
+        self.net.zero_grad()
+        try:
+            # inner step: 在 support 上做虚拟更新 W' = W - xi * grad_W L_support
+            support_output = self.net(support_images)
+            support_total, _, _, _ = self._compose_total_loss(
+                support_output,
+                support_labels,
+                support_images,
+                include_kd=bool(self.retrain_meta_use_kd),
+                include_prox=False,
+            )
+            support_total.backward()
+            with torch.no_grad():
+                for p in params:
+                    if p.grad is not None:
+                        p.add_(p.grad, alpha=-inner_lr)
+            self.optimizer.zero_grad()
+            self.net.zero_grad()
+
+            # outer step: 在 query 上计算梯度，并回写到原始权重
+            query_output = self.net(query_images)
+            query_total, _, _, query_output = self._compose_total_loss(
+                query_output,
+                query_labels,
+                query_images,
+                include_kd=bool(self.retrain_meta_use_kd),
+                include_prox=True,
+            )
+            query_total.backward()
+        finally:
+            with torch.no_grad():
+                for p, old in zip(params, backup):
+                    p.copy_(old)
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
+        self.optimizer.step()
+        return query_output.detach(), query_labels, query_total.detach()
+
     def train_run_manager_one_epoch(self, adjust_lr_func, round_data_meter=None):
         batch_time = AverageMeter()
         data_time = AverageMeter()
@@ -1499,88 +1693,25 @@ class RunManager:
                 round_data_meter=round_data_meter,
             )
             
-
-            # ========== 前向 ==========
-            output = self.net(images)
-            if not torch.isfinite(output).all():
-                output = torch.nan_to_num(output, nan=0.0, posinf=1e4, neginf=-1e4)
-
-            # CE 基础 loss
-            if self.run_config.label_smoothing > 0:
-                ce_loss = cross_entropy_with_label_smoothing(
-                    output, labels, self.run_config.label_smoothing
-                )
+            metric_output = None
+            metric_labels = labels
+            total_loss = None
+            meta_result = self._meta_train_step(images, labels, current_lr=new_lr)
+            if meta_result is not None:
+                metric_output, metric_labels, total_loss = meta_result
             else:
-                ce_loss = self.criterion(output, labels)
-
-            if not torch.isfinite(ce_loss):
-                if i == 0 or i % 10 == 0:
-                    print(
-                        f"[Train] non-finite ce_loss detected (loss={ce_loss.item()}), clamp to 0 at batch {i}"
-                    )
-                ce_loss = torch.zeros_like(ce_loss)
-
-            # ========== KD logit loss（只算数值，真正用在哪取决于模式）==========
-            kd_loss = None
-            if (
-                self.enable_kd
-                and self.teacher_model is not None
-                and self.cl_kd_logit_lambda > 0
-                and self.cl_kd_method in ["logit", "logit_conf"]
-            ):
-                with torch.no_grad():
-                    teacher_out = self.teacher_model(images)
-                    if not torch.isfinite(teacher_out).all():
-                        teacher_out = torch.nan_to_num(
-                            teacher_out, nan=0.0, posinf=1e4, neginf=-1e4
-                        )
-                T = self.cl_kd_temperature if self.cl_kd_temperature > 0 else 1.0
-                student_log_probs = F.log_softmax(output / T, dim=1)
-                teacher_probs = F.softmax(teacher_out / T, dim=1)
-
-                if self.cl_kd_method == "logit":
-                    kd_loss = F.kl_div(
-                        student_log_probs, teacher_probs, reduction="batchmean"
-                    ) * (T * T)
-                else:  # logit_conf
-                    # 只保留 teacher 置信度高于阈值的类别做 KL
-                    mask = (teacher_probs > self.cl_kd_conf_threshold).float()
-                    if mask.sum() > 0:
-                        log_teacher = torch.log(teacher_probs + 1e-12)
-                        kl_elem = (teacher_probs * (log_teacher - student_log_probs)) * mask
-                        kd_loss = (kl_elem.sum() / mask.sum()) * (T * T)
-                    else:
-                        kd_loss = None
-
-            # ========== 统一 total_loss 计算 ==========
-            total_loss = ce_loss
-            if kd_loss is not None:
-                total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
-            if self._prox_mu > 0 and self._prox_reference_state:
-                prox_penalty = torch.zeros(1, device=self.device)
-                for name, p in self.net.module.named_parameters():
-                    ref = self._prox_reference_state.get(name)
-                    if ref is None:
-                        continue
-                    prox_penalty = prox_penalty + torch.sum((p - ref) ** 2)
-                total_loss = total_loss + 0.5 * self._prox_mu * prox_penalty
-            self.optimizer.zero_grad()
-            self.net.zero_grad()
-            total_loss.backward()
-
-            # 更新参数
-            torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
-            self.optimizer.step()
+                metric_output, metric_labels, total_loss = self._standard_train_step(images, labels)
             
             # 将当前任务样本加入重放缓冲区（仅当前 batch 原样本）
             if replay_is_enabled(self):
                 self.replay_buffer.add_batch(cur_x_cpu, cur_y_cpu, self.task_id)
                 
             # ========== 统计&时间 ==========
-            acc1, acc5 = accuracy(output, labels, topk=(1, 5))
-            losses.update(total_loss.item(), images.size(0))
-            top1.update(acc1[0].item(), images.size(0))
-            top5.update(acc5[0].item(), images.size(0))
+            acc1, acc5 = accuracy(metric_output, metric_labels, topk=(1, 5))
+            sample_count = int(metric_labels.size(0))
+            losses.update(float(total_loss.item()), sample_count)
+            top1.update(acc1[0].item(), sample_count)
+            top5.update(acc5[0].item(), sample_count)
             lr.update(new_lr, 1)
 
             batch_time.update(time.time() - end)
@@ -2007,6 +2138,12 @@ class CifarRunConfig(RunConfig):
         cl_kd_conf_threshold: float = 0.5,
         enable_kd: bool = False,
         enable_replay: bool = False,
+        retrain_meta_enable: bool = False,
+        retrain_meta_support_ratio: float = 0.5,
+        retrain_meta_inner_lr: float = -1.0,
+        retrain_meta_noise_ratio: float = 0.0,
+        retrain_meta_noise_std: float = 0.0,
+        retrain_meta_use_kd: bool = True,
         **kwargs,
     ):
         print(f"CifarRunConfig初始化开始... is_client={is_client} client_id={client_id}")
@@ -2057,6 +2194,12 @@ class CifarRunConfig(RunConfig):
         self.cl_kd_conf_threshold = float(cl_kd_conf_threshold)
         self.enable_kd = bool(enable_kd)
         self.enable_replay = bool(enable_replay)
+        self.retrain_meta_enable = bool(retrain_meta_enable)
+        self.retrain_meta_support_ratio = float(retrain_meta_support_ratio)
+        self.retrain_meta_inner_lr = float(retrain_meta_inner_lr)
+        self.retrain_meta_noise_ratio = float(retrain_meta_noise_ratio)
+        self.retrain_meta_noise_std = float(retrain_meta_noise_std)
+        self.retrain_meta_use_kd = bool(retrain_meta_use_kd)
 
         # 推导每任务类别数（若未显式给出）
         total_classes = None

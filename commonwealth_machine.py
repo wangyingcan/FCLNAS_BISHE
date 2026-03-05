@@ -61,6 +61,21 @@ class CommonwealthMachine:
         with open(metrics_path, "a", encoding="utf-8") as fout:
             fout.write(json.dumps(record, ensure_ascii=True) + "\n")
 
+    def _append_test_top1_stats(self, round_idx, tag, stats_record):
+        record = {
+            "phase": "retrain_test_summary",
+            "round": int(round_idx),
+            "tag": tag,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+        task_id = getattr(getattr(self.global_run_manager, "run_config", None), "task_id", None)
+        if task_id is not None:
+            record["task_id"] = int(task_id)
+        record.update(stats_record)
+        stats_path = os.path.join(self.logs_path, "client_test_top1_stats.jsonl")
+        with open(stats_path, "a", encoding="utf-8") as fout:
+            fout.write(json.dumps(record, ensure_ascii=True) + "\n")
+
     def _emit_progress(self, event, **payload):
         runtime_context = getattr(self.config, "runtime_context", None)
         callback = getattr(runtime_context, "progress_callback", None)
@@ -136,6 +151,9 @@ class CommonwealthMachine:
     
     def run(self):
         print('self.config.resume: ', self.config.resume)
+        retrain_fedavg = bool(getattr(self.config, "retrain_fedavg", False))
+        if retrain_fedavg:
+            self.write_log("[Retrain] FedAvg aggregation is enabled for this stage", prefix="retrain")
         if self.config.resume:
             try:
                 print('loading personalized client checkpoints:')
@@ -170,11 +188,14 @@ class CommonwealthMachine:
                                                                                  local_epoch_number=self.local_epoch_number)
             print(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
             local_compute_start = time.time()
+            server_model = copy.deepcopy(self.global_run_manager.net) if retrain_fedavg else None
+            clients_params_arr = []
+            clients_data_w = []
             for idx in self.clients_idx_arr:
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = self.clients[idx].train_run_manager(
                     start_local_epoch=start_local_epoch,
                     last_local_epoch=last_local_epoch,
-                    server_model=None,
+                    server_model=server_model,
                     writer=self.writerTf,
                     global_round_idx=round + 1,
                     preserve_local_model=(
@@ -224,6 +245,16 @@ class CommonwealthMachine:
                 client_checkpoint_io_start = time.time()
                 self.clients[idx].save_model(client_checkpoint, is_best=False)
                 checkpoint_io_time += time.time() - client_checkpoint_io_start
+                if retrain_fedavg:
+                    local_weight = self.clients[idx].get_local_data_weight()
+                    if local_weight > 0:
+                        clients_params_arr.append(copy.deepcopy(self.clients[idx].return_model_dict()))
+                        clients_data_w.append(local_weight)
+                    else:
+                        self.write_log(
+                            f"skip client {idx} in retrain round {round} aggregation because local data weight is 0",
+                            prefix="retrain",
+                        )
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)
@@ -232,6 +263,33 @@ class CommonwealthMachine:
                 clients_val_top5.update(val_top5)
                 clients_lr.update(lr)
             local_compute_time += time.time() - local_compute_start
+            if retrain_fedavg:
+                aggregation_start = time.time()
+                if len(clients_params_arr) == 0:
+                    self.write_log(
+                        f"retrain round {round} skip FedAvg because no client has positive sample weight",
+                        prefix="retrain",
+                    )
+                else:
+                    new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
+                    server_dict = self.global_run_manager.net.module.state_dict()
+                    server_dict.update(new_weight_fedavg)
+                    self.global_run_manager.net.module.load_state_dict(server_dict)
+                    global_state = self.global_run_manager.net.module.state_dict()
+                    for idx in self.clients_idx_arr:
+                        self.clients[idx].net.module.load_state_dict(global_state, strict=False)
+                    global_checkpoint = {
+                        "round": round,
+                        "state_dict": self.global_run_manager.net.module.state_dict(),
+                    }
+                    global_ckpt_io_start = time.time()
+                    self.global_run_manager.save_model(
+                        global_checkpoint,
+                        is_best=False,
+                        model_name="global.pth.tar",
+                    )
+                    checkpoint_io_time += time.time() - global_ckpt_io_start
+                aggregation_time += time.time() - aggregation_start
             self.writerTf.add_scalar('clients_trn_loss', clients_trn_loss.avg, round)
             self.writerTf.add_scalar('clients_trn_top1', clients_trn_top1.avg, round)
             self.writerTf.add_scalar('clients_trn_top5', clients_trn_top5.avg, round)
@@ -250,7 +308,10 @@ class CommonwealthMachine:
                 prefix='retrain')
             # personalized retrain: no federated aggregation in this stage
             evaluation_start = time.time()
-            avg_test_loss, avg_test_top1, avg_test_top5 = self.test_inference(tag="learned_net")
+            avg_test_loss, avg_test_top1, avg_test_top5 = self.test_inference(
+                tag="learned_net",
+                round_idx=round,
+            )
             self.writerTf.add_scalar('global_test_loss', avg_test_loss, round)
             self.writerTf.add_scalar('global_test_top1', avg_test_top1, round)
             self.writerTf.add_scalar('global_test_top5', avg_test_top5, round)
@@ -307,16 +368,33 @@ class CommonwealthMachine:
         return copy.deepcopy(self.global_run_manager.net.module.state_dict())
 
     
-    def test_inference(self, tag=None):
+    def test_inference(self, tag=None, round_idx=None):
         # Test inference after completion of training. For personalized retrain, report cluster-average client accuracy.
         client_losses = AverageMeter()
         client_top1 = AverageMeter()
         client_top5 = AverageMeter()
+        per_client_top1 = []
+        per_client_loss = []
+        per_client_top5 = []
+        per_client_test_weight = []
         for idx in self.clients_idx_arr:
             val_loss, val_acc_top1, val_acc_top5 = self.clients[idx].validate(is_test=True, return_top5=True)
             client_losses.update(val_loss)
             client_top1.update(val_acc_top1)
             client_top5.update(val_acc_top5)
+            per_client_loss.append(float(val_loss))
+            per_client_top1.append(float(val_acc_top1))
+            per_client_top5.append(float(val_acc_top5))
+            test_weight = int(getattr(self.clients[idx].run_config.data_provider, "tst_set_length", 0))
+            per_client_test_weight.append(test_weight)
+            self._append_per_client_metric(
+                round_idx if round_idx is not None else -1,
+                idx,
+                test_loss=float(val_loss),
+                test_top1=float(val_acc_top1),
+                test_top5=float(val_acc_top5),
+                test_weight=test_weight,
+            )
             try:
                 self.clients[idx].write_log(
                     f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] client{idx},test_eval loss {val_loss:.4f}, top1 {val_acc_top1:.4f}, top5 {val_acc_top5:.4f}",
@@ -333,6 +411,39 @@ class CommonwealthMachine:
             prefix='test',
             should_print=True
         )
+        if per_client_top1:
+            arr_top1 = np.array(per_client_top1, dtype=np.float64)
+            arr_loss = np.array(per_client_loss, dtype=np.float64)
+            arr_top5 = np.array(per_client_top5, dtype=np.float64)
+            arr_weight = np.array(per_client_test_weight, dtype=np.float64)
+            weighted_top1 = float(np.average(arr_top1, weights=arr_weight)) if np.sum(arr_weight) > 0 else float(np.mean(arr_top1))
+            stats_record = {
+                "client_count": int(len(arr_top1)),
+                "test_top1_mean": float(np.mean(arr_top1)),
+                "test_top1_std": float(np.std(arr_top1)),
+                "test_top1_min": float(np.min(arr_top1)),
+                "test_top1_max": float(np.max(arr_top1)),
+                "test_top1_weighted_mean": weighted_top1,
+                "test_loss_mean": float(np.mean(arr_loss)),
+                "test_top5_mean": float(np.mean(arr_top5)),
+            }
+            self._append_test_top1_stats(
+                round_idx if round_idx is not None else -1,
+                prefix_name,
+                stats_record,
+            )
+            self.write_log(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                + "clients_test_top1_stats mean {:.4f}, std {:.4f}, min {:.4f}, max {:.4f}, weighted_mean {:.4f}".format(
+                    stats_record["test_top1_mean"],
+                    stats_record["test_top1_std"],
+                    stats_record["test_top1_min"],
+                    stats_record["test_top1_max"],
+                    stats_record["test_top1_weighted_mean"],
+                ),
+                prefix='test',
+                should_print=True,
+            )
         return client_losses.avg, client_top1.avg, client_top5.avg
 
     

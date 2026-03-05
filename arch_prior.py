@@ -284,7 +284,31 @@ def load_client_histories(load_path: str, num_clients: int) -> List[ClientHistor
     return histories
 
 
-def export_supernet_client_subnet(search_manager, artifact_path: str, supernet_kwargs: dict):
+def _build_subnet_net_info(normal_net, data_shape: Optional[List[int]] = None) -> dict:
+    total_params = sum(int(p.numel()) for p in normal_net.parameters())
+    net_info = {
+        "param": "%.2fM" % (total_params / 1e6),
+    }
+    module_str = getattr(normal_net, "module_str", None)
+    if module_str is not None:
+        net_info["module_str"] = str(module_str)
+    if data_shape is not None and hasattr(normal_net, "get_flops"):
+        try:
+            input_var = torch.zeros([1] + list(data_shape), device=torch.device("cpu"))
+            flops, _ = normal_net.get_flops(input_var)
+            net_info["flops"] = "%.1fM" % (float(flops) / 1e6)
+        except Exception:
+            # 导出阶段不应因统计失败中断主流程
+            pass
+    return net_info
+
+
+def export_supernet_client_subnet(
+    search_manager,
+    artifact_path: str,
+    supernet_kwargs: dict,
+    export_dir: Optional[str] = None,
+):
     export_kwargs = dict(supernet_kwargs)
     export_kwargs["width_stages"] = list(export_kwargs.get("width_stages", []))
     export_kwargs["n_cell_stages"] = list(export_kwargs.get("n_cell_stages", []))
@@ -303,6 +327,20 @@ def export_supernet_client_subnet(search_manager, artifact_path: str, supernet_k
         "state_dict": normal_net.state_dict(),
     }
     atomic_torch_save(payload, artifact_path)
+
+    if export_dir:
+        os.makedirs(export_dir, exist_ok=True)
+        with open(os.path.join(export_dir, "net.config"), "w") as fout:
+            json.dump(normal_net.config, fout, indent=4)
+        data_shape = None
+        try:
+            data_shape = list(search_manager.run_manager.run_config.data_provider.data_shape)
+        except Exception:
+            data_shape = None
+        net_info = _build_subnet_net_info(normal_net, data_shape=data_shape)
+        with open(os.path.join(export_dir, "net_info.txt"), "w") as fout:
+            fout.write(json.dumps(net_info, indent=4) + "\n")
+
     return normal_net
 
 

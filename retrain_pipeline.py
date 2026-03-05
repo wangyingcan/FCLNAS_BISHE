@@ -501,6 +501,8 @@ def run_baseline_retrain_pipeline(
     helpers: RetrainPipelineHelpers,
 ):
     args.search = False
+    # baseline 对照组使用标准 FedAvg 聚合
+    args.retrain_fedavg = True
     retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
     retrain_run_config_kwargs = _build_retrain_run_config_kwargs(args, retrain_last_round)
     args.client_id = 0

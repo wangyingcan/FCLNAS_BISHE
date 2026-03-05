@@ -73,6 +73,7 @@ class ClusteringMachine:
     def train_clients(self):
         self.start_round = self.global_server.round
         print('len(self.clients_idx_arr): ', len(self.clients_idx_arr))
+        federate_arch_params = bool(getattr(self.config, "federate_arch_params", False))
         best_val_acc = 0
         self._emit_progress("search_started")
         for round in range(self.start_round, self.last_round):
@@ -142,8 +143,11 @@ class ClusteringMachine:
                     last_local_epoch=last_local_epoch,
                     writer=self.writerTf,
                     preserve_local_arch_params=(
-                        round == self.start_round
-                        and bool(getattr(self.clients[idx], "preserve_local_arch_params_for_first_sync", False))
+                        (not federate_arch_params)
+                        or (
+                            round == self.start_round
+                            and bool(getattr(self.clients[idx], "preserve_local_arch_params_for_first_sync", False))
+                        )
                     ),
                 )
                 if round == self.start_round:
@@ -154,7 +158,13 @@ class ClusteringMachine:
                     # 跳过无数据客户端，避免聚合时 total_weight=0 -> NaN
                     self.write_log(f"skip client {idx} in round {round} because local data weight is 0", prefix='search')
                     continue
-                clients_params_arr.append(copy.deepcopy(self.clients[idx].run_manager.return_model_dict()))
+                clients_params_arr.append(
+                    copy.deepcopy(
+                        self.clients[idx].run_manager.return_model_dict(
+                            exclude_arch_params=(not federate_arch_params)
+                        )
+                    )
+                )
                 clients_data_w.append(local_weight)
                 client_round_prefix = f"task_{self.task_id}_client_{idx}_round"
                 self.writerTf.add_scalar(client_round_prefix + "_search_trn_loss", trn_loss, round)
@@ -326,6 +336,7 @@ class ClusteringMachine:
     def warmup_clients(self):
         self.warmup_round = self.global_server.warmup_round
         print('len(self.clients_idx_arr): ', len(self.clients_idx_arr))
+        federate_arch_params = bool(getattr(self.config, "federate_arch_params", False))
         self._emit_progress("warmup_started")
         for round in range(self.warmup_round, self.config.warmup_n_rounds):
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
@@ -344,12 +355,19 @@ class ClusteringMachine:
                 # 预热阶段客户端的训练：随机子网前后向，只更新权重，不更新架构参数
                 trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, lr = self.clients[
                     idx].warm_up(server_model=server_model, start_local_epoch=start_local_epoch,
-                                 last_local_epoch=last_local_epoch, writer=self.writerTf)
+                                 last_local_epoch=last_local_epoch, writer=self.writerTf,
+                                 preserve_local_arch_params=(not federate_arch_params))
                 local_weight = self.clients[idx].get_local_data_weight()
                 if local_weight <= 0:
                     self.write_log(f"skip client {idx} in warmup round {round} because local data weight is 0", prefix='warmup')
                     continue
-                clients_params_arr.append(copy.deepcopy(self.clients[idx].run_manager.return_model_dict()))
+                clients_params_arr.append(
+                    copy.deepcopy(
+                        self.clients[idx].run_manager.return_model_dict(
+                            exclude_arch_params=(not federate_arch_params)
+                        )
+                    )
+                )
                 clients_data_w.append(local_weight)
                 client_round_prefix = f"task_{self.task_id}_client_{idx}_round"
                 self.writerTf.add_scalar(client_round_prefix + "_warmup_trn_loss", trn_loss, round)

@@ -1175,11 +1175,15 @@ class RunManager:
             self.optimizer.load_state_dict(checkpoint[client_key])  # 加载优化器状态
         print(f"=> loaded client checkpoint '{model_fname}'")
 
-    def return_model_dict(
-        self,
-    ):
+    def return_model_dict(self, exclude_arch_params=False):
         _w = self.net.module.state_dict()
-        return _w
+        if not exclude_arch_params:
+            return _w
+        return {
+            key: value
+            for key, value in _w.items()
+            if "AP_path_alpha" not in key and "AP_path_wb" not in key
+        }
 
     def get_run_manager_model(self):
         return self.net.module

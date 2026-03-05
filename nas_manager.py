@@ -928,13 +928,32 @@ class ArchSearchRunManager:
         start_local_epoch=None,
         last_local_epoch=None,
         writer=None,
+        preserve_local_arch_params=False,
     ):
         # ========== Warmup 总览：用当前训练集预训练权重，不更新架构参数 ==========
         if server_model != None:
             if isinstance(server_model, nn.DataParallel):
-                self.net.load_state_dict(server_model.module.state_dict())
+                net_dict = self.net.state_dict()
+                server_state = server_model.module.state_dict()
+                if preserve_local_arch_params:
+                    server_state = {
+                        key: value
+                        for key, value in server_state.items()
+                        if "AP_path_alpha" not in key and "AP_path_wb" not in key
+                    }
+                net_dict.update(server_state)
+                self.net.load_state_dict(net_dict)
             else:
-                self.net.load_state_dict(server_model.state_dict())
+                net_dict = self.net.state_dict()
+                server_state = server_model.state_dict()
+                if preserve_local_arch_params:
+                    server_state = {
+                        key: value
+                        for key, value in server_state.items()
+                        if "AP_path_alpha" not in key and "AP_path_wb" not in key
+                    }
+                net_dict.update(server_state)
+                self.net.load_state_dict(net_dict)
         
         # 预准备：不做权重锚定/EWC/正则/正交/蒸馏
         # distill_model = None

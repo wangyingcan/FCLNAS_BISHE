@@ -150,6 +150,30 @@ def load_prev_task(super_net, prev_task_path: str):
     return False
 
 
+def load_task1_bootstrap(super_net, bootstrap_ckpt_path: str):
+    """
+    仅用于 task1：从外部超网 checkpoint 初始化 supernet。
+    支持 `{"state_dict": ...}` 或直接 state_dict 结构。
+    """
+    if not bootstrap_ckpt_path:
+        return False
+    ckpt_path = os.path.abspath(bootstrap_ckpt_path)
+    if not os.path.isfile(ckpt_path):
+        print(f"[FCL] Task1 bootstrap checkpoint not found: {ckpt_path}, start task1 from scratch.")
+        return False
+    try:
+        checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        model_dict = super_net.state_dict()
+        model_dict.update(state_dict)
+        super_net.load_state_dict(model_dict)
+        print(f"[FCL] Loaded task1 bootstrap supernet from {ckpt_path}")
+        return True
+    except Exception as e:
+        print(f"[FCL] Failed to load task1 bootstrap supernet from {ckpt_path}: {e}")
+        return False
+
+
 def load_prev_task_optimizers(run_mgr, prev_task_path: str, client_id: int, task_id_from: int, is_server: bool = False):
     """
     尝试从上一任务的 checkpoint 中恢复当前 run_mgr 的优化器状态。
@@ -426,14 +450,18 @@ def run_nas_search_for_task(
         task_id=task_id,
     )
     search_machine.run()
-    if getattr(args, "enable_arch_prior", False) and client_histories is not None and current_task_path is not None:
-        arch_prior_log_path = os.path.join(current_task_path, "logs", "arch_prior_details.jsonl")
+    if current_task_path is not None:
         client_artifact_dir = os.path.join(current_task_path, "client_subnets")
         os.makedirs(client_artifact_dir, exist_ok=True)
+        should_update_prior_history = (
+            getattr(args, "enable_arch_prior", False) and client_histories is not None
+        )
+        arch_prior_log_path = os.path.join(current_task_path, "logs", "arch_prior_details.jsonl")
+
         for idx in client_indices:
             client = clients[idx]
-            history = client_histories[idx]
             artifact_path = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}_subnet.pt")
+            artifact_export_dir = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}")
             normal_net = export_supernet_client_subnet(
                 client,
                 artifact_path,
@@ -448,7 +476,13 @@ def run_nas_search_for_task(
                     "dropout_rate": args.dropout,
                     "inference_device": args.object_to_search,
                 },
+                export_dir=artifact_export_dir,
             )
+
+            if not should_update_prior_history:
+                continue
+
+            history = client_histories[idx]
             prior_state = getattr(client, "arch_prior_state", None) or {}
             current_proto = prior_state.get("current_proto")
             if current_proto is None:
@@ -487,15 +521,19 @@ def run_nas_search_for_task(
                         **proto_stats,
                     },
                 )
-        save_client_histories(
-            client_histories,
-            os.path.join(current_task_path, "client_arch_prior_histories.pt"),
-        )
+
+        if should_update_prior_history:
+            save_client_histories(
+                client_histories,
+                os.path.join(current_task_path, "client_arch_prior_histories.pt"),
+            )
     return search_machine.get_server()
 
 
 def train_personalized_subnet(args, global_run_manager, clients, client_indices, start_round, last_round):
     # TODO: 在此处接入个性化元学习初始化。
+    # NAS 子网重训阶段固定为“仅本地训练，不做聚合”。
+    args.retrain_fedavg = False
     retrain_machine = CommonwealthMachine(
         target_hardware="supernet",
         config=args,
@@ -535,6 +573,8 @@ def parse_args() -> argparse.Namespace:
     # ProxylessNAS
     parser.add_argument("--warmup", action="store_true", help="if have not warmup(only pretrain supernet, don't nas), please set it True")
     parser.add_argument("--path", type=str, default="./output/proxyless-", help="checkpoint save path")
+    parser.add_argument("--task1_bootstrap_ckpt", type=str, default="./global.pth.tar",
+                        help="task1 启动时的超网初始化 checkpoint 路径；文件存在时自动加载，仅作用于 task1")
     parser.add_argument("--save_env", type=str, default="EXP", help="experiment time name to save exp code")
     parser.add_argument("--resume", action="store_true", help="load last checkpoint")
     parser.add_argument("-R", "--auto_resume", action="store_true",
@@ -546,6 +586,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retrain_last_round", type=int, default=20, help="重训阶段最后轮次，默认沿用 last_round")
     parser.add_argument("--retrain_sequence_from_task1", action="store_true",
                         help="重训阶段依次从 task1 训练到当前任务，每个任务各跑 retrain_last_round 轮")
+    parser.add_argument("--retrain_fedavg", type=parse_optional_bool, nargs="?", const=True, default=False,
+                        help="重训阶段是否启用 FedAvg 聚合；默认 False（用于 NAS 子网个性化本地重训）")
+    parser.add_argument("--federate_arch_params", type=parse_optional_bool, nargs="?", const=True, default=False,
+                        help="是否在联邦阶段聚合并下发架构参数 alpha(AP_path_alpha/AP_path_wb)；默认 False（客户端独立持有架构参数）")
     parser.add_argument("--enable_arch_prior", action="store_true",
                         help="是否在 NAS 搜索前启用历史先验引导的架构参数初始化，默认关闭")
     parser.add_argument("--arch_prior_topk", type=int, default=3,
@@ -1182,8 +1226,14 @@ def main():
         
         # 如果非首任务，尝试加载上一任务的权重
         loaded_prev_supernet = False
+        loaded_task1_bootstrap = False
+        task1_bootstrap_ckpt_path = None
+        if task_id == 1:
+            task1_bootstrap_ckpt_path = os.path.abspath(getattr(args, "task1_bootstrap_ckpt", "./global.pth.tar"))
+            loaded_task1_bootstrap = load_task1_bootstrap(super_net, task1_bootstrap_ckpt_path)
         if task_id > 1:
             loaded_prev_supernet = load_prev_task(super_net, prev_task_path)
+        inherited_supernet = loaded_prev_supernet or loaded_task1_bootstrap
             
         # 记录当前超网签名，便于判断是否继承成功（与上一任务相比应保持连续，不应回到随机分布）
         log_dir = os.path.join(args.path, "logs")
@@ -1195,6 +1245,8 @@ def main():
                 "stage": "init_supernet",
                 "task_id": task_id,
                 "loaded_prev_supernet": loaded_prev_supernet,
+                "loaded_task1_bootstrap": loaded_task1_bootstrap,
+                "task1_bootstrap_ckpt_path": task1_bootstrap_ckpt_path,
                 "signature": model_signature(super_net),
             }) + "\n")
         base_supernet_state = copy.deepcopy(super_net.state_dict())
@@ -1233,7 +1285,7 @@ def main():
         global_server = ArchSearchRunManager(
             args.path, super_net, run_config_global_server,
             arch_search_config_global_server, warmup=args.warmup, task_id=args.task_id,
-            init_model=not loaded_prev_supernet,
+            init_model=not inherited_supernet,
             replay_buffer=None,
         )
         # 继承上一任务的全局优化器状态（在 global_server 创建后再尝试）
@@ -1291,7 +1343,7 @@ def main():
             client = ArchSearchRunManager(
                 args.path, local_client_super_net,
                 clients_run_config_arr[idx], asc_local, task_id=args.task_id,
-                init_model=not loaded_prev_supernet,
+                init_model=not inherited_supernet,
                 replay_buffer=None,
             )
             _attach_replay_cfg(client.run_manager.run_config, args)

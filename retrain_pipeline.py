@@ -44,9 +44,13 @@ def _build_retrain_run_config_kwargs(args, retrain_last_round: int):
     return cfg
 
 
-def _prepare_retrain_run_config(run_config: CifarRunConfig, retrain_last_round: int):
+def _prepare_retrain_run_config(
+    run_config: CifarRunConfig,
+    retrain_last_round: int,
+    local_epoch_number: int = 1,
+):
     run_config.search = False
-    run_config.n_epochs = _retrain_total_epochs(run_config, retrain_last_round)
+    run_config.n_epochs = max(1, int(local_epoch_number) * int(retrain_last_round))
     return run_config
 
 
@@ -332,7 +336,11 @@ def run_supernet_retrain_pipeline(
         client = RunManager(
             client_path,
             client_net,
-            _prepare_retrain_run_config(clients_run_config_arr[idx], retrain_last_round),
+            _prepare_retrain_run_config(
+                clients_run_config_arr[idx],
+                retrain_last_round,
+                local_epoch_number=getattr(args, "local_epoch_number", 1),
+            ),
             init_model=False,
             task_id=task_id,
             replay_buffer=replay_buffers_across_tasks[idx],
@@ -617,7 +625,11 @@ def run_baseline_retrain_pipeline(
         client_run_config_kwargs["client_id"] = idx
         client_run_config = CifarRunConfig(**client_run_config_kwargs, is_client=True)
         helpers.attach_replay_cfg(client_run_config, args)
-        _prepare_retrain_run_config(client_run_config, retrain_last_round)
+        _prepare_retrain_run_config(
+            client_run_config,
+            retrain_last_round,
+            local_epoch_number=getattr(args, "local_epoch_number", 1),
+        )
         client_net = BaselineResNet(
             arch=args.baseline_arch,
             num_classes=client_run_config.data_provider.n_classes,

@@ -494,6 +494,9 @@ class RunManager:
         self._buffer_train_batch_count = None
         self.stage_training_buffer = None
         self.allow_mix_during_stage = False
+        # Ditto 等个性化方法可选的 proximal 正则上下文（按轮注入，默认关闭）
+        self._prox_reference_state = None
+        self._prox_mu = 0.0
 
     def load_ewc_state(self, state):
         """加载外部保存的 EWC 状态；state=None 时重置。"""
@@ -1553,6 +1556,14 @@ class RunManager:
             total_loss = ce_loss
             if kd_loss is not None:
                 total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
+            if self._prox_mu > 0 and self._prox_reference_state:
+                prox_penalty = torch.zeros(1, device=self.device)
+                for name, p in self.net.module.named_parameters():
+                    ref = self._prox_reference_state.get(name)
+                    if ref is None:
+                        continue
+                    prox_penalty = prox_penalty + torch.sum((p - ref) ** 2)
+                total_loss = total_loss + 0.5 * self._prox_mu * prox_penalty
             self.optimizer.zero_grad()
             self.net.zero_grad()
             total_loss.backward()
@@ -1785,7 +1796,19 @@ class RunManager:
         writer=None,
         global_round_idx=None,
         preserve_local_model=False,
+        prox_reference_state=None,
+        prox_mu=0.0,
     ):
+        self._prox_mu = float(prox_mu) if prox_mu is not None else 0.0
+        if self._prox_mu > 0 and prox_reference_state:
+            prox_state = {}
+            for name, tensor in prox_reference_state.items():
+                if torch.is_tensor(tensor) and tensor.dtype.is_floating_point:
+                    prox_state[name] = tensor.detach().to(self.device)
+            self._prox_reference_state = prox_state if prox_state else None
+        else:
+            self._prox_reference_state = None
+
         if server_model != None and not preserve_local_model:
             if isinstance(server_model, nn.DataParallel):
                 self.net.module.load_state_dict(server_model.module.state_dict())
@@ -1923,6 +1946,8 @@ class RunManager:
             val_loss, val_acc, val_acc5 = self.validate(is_test=False, return_top5=True)
 
         lr_value = lr.avg if isinstance(lr, AverageMeter) else lr
+        self._prox_reference_state = None
+        self._prox_mu = 0.0
         return (
             train_losses_arr.avg,
             train_acc_top1_arr.avg,

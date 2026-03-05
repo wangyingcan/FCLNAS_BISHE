@@ -671,6 +671,30 @@ def parse_args() -> argparse.Namespace:
                         help="fixed backbone name in torchvision.models, e.g. resnet18/resnet34/resnet50")
     parser.add_argument("--baseline_pretrained", action="store_true",
                         help="use torchvision pretrained weights for baseline backbones")
+    parser.add_argument("--baseline_method", type=str, default="fedavg",
+                        choices=["fedavg", "target", "re_fed", "ditto", "fedweit", "re-fed"],
+                        help="baseline 策略：fedavg / target / re_fed / ditto / fedweit")
+    parser.add_argument("--baseline_auto_config", type=parse_optional_bool, nargs="?", const=True, default=True,
+                        help="是否对 baseline_method 自动填充推荐超参（replay/KD 等），默认 True")
+    parser.add_argument("--baseline_replay_mode", type=str, default="task_balanced",
+                        choices=["none", "global", "task_balanced", "age_priority"],
+                        help="baseline 自动配置 replay 时使用的模式")
+    parser.add_argument("--baseline_replay_capacity_ratio", type=float, default=0.1,
+                        help="baseline 自动配置 replay 时的容量比例（仅在未显式设置 replay_capacity/replay_capacity_ratio 时生效）")
+    parser.add_argument("--baseline_replay_per_batch", type=int, default=32,
+                        help="baseline 自动配置 replay 时每 batch 重放样本数（仅在 replay_per_batch<=0 时生效）")
+    parser.add_argument("--baseline_target_kd_method", type=str, default="logit",
+                        choices=["none", "logit", "logit_conf"],
+                        help="baseline_method=target 自动配置 KD 时的蒸馏方式")
+    parser.add_argument("--baseline_target_kd_lambda", type=float, default=1.0,
+                        help="baseline_method=target 自动配置 KD 权重（仅在 cl_kd_logit_lambda<=0 时生效）")
+    parser.add_argument("--baseline_target_kd_temperature", type=float, default=2.0,
+                        help="baseline_method=target 自动配置 KD 温度（仅在 cl_kd_temperature<=0 时生效）")
+    parser.add_argument("--ditto_mu", type=float, default=0.01,
+                        help="baseline_method=ditto 时的 proximal 正则系数")
+    parser.add_argument("--fedweit_personal_keys", type=str,
+                        default="backbone.fc.weight,backbone.fc.bias,fc.weight,fc.bias,classifier.weight,classifier.bias,linear.weight,linear.bias",
+                        help="baseline_method=fedweit 时不参与全局聚合、保持客户端个性化的参数键（逗号分隔）")
 
     # supernet config（看代码细节了解搜索空间的工作原理）
     parser.add_argument("--width_stages", type=str, default="24,40,80,96,192,320",

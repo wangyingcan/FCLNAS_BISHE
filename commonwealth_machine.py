@@ -151,9 +151,30 @@ class CommonwealthMachine:
     
     def run(self):
         print('self.config.resume: ', self.config.resume)
+        baseline_method = str(getattr(self.config, "baseline_method", "fedavg")).lower().replace("-", "_")
         retrain_fedavg = bool(getattr(self.config, "retrain_fedavg", False))
+        use_ditto = retrain_fedavg and baseline_method == "ditto"
+        use_fedweit = retrain_fedavg and baseline_method == "fedweit"
+        fedweit_personal_keys = set()
+        if use_fedweit:
+            raw_keys = getattr(self.config, "fedweit_personal_keys", "")
+            if isinstance(raw_keys, str):
+                fedweit_personal_keys = {k.strip() for k in raw_keys.split(",") if k.strip()}
+            elif isinstance(raw_keys, (list, tuple, set)):
+                fedweit_personal_keys = {str(k).strip() for k in raw_keys if str(k).strip()}
+        ditto_mu = float(getattr(self.config, "ditto_mu", 0.01))
         if retrain_fedavg:
             self.write_log("[Retrain] FedAvg aggregation is enabled for this stage", prefix="retrain")
+        if use_fedweit:
+            self.write_log(
+                f"[Retrain] baseline_method=fedweit, keep personalized keys: {sorted(fedweit_personal_keys)}",
+                prefix="retrain",
+            )
+        if use_ditto:
+            self.write_log(
+                f"[Retrain] baseline_method=ditto, proximal_mu={ditto_mu:.6f}",
+                prefix="retrain",
+            )
         if self.config.resume:
             try:
                 print('loading personalized client checkpoints:')
@@ -175,6 +196,12 @@ class CommonwealthMachine:
             self.start_round = 0
         print(f"[Retrain] start_round={self.start_round}, last_round={self.last_round}")
         self._log_retrain_init_snapshot()
+        ditto_personal_states = None
+        if use_ditto:
+            ditto_personal_states = [
+                copy.deepcopy(self.clients[idx].net.module.state_dict())
+                for idx in self.clients_idx_arr
+            ]
         for round in range(self.start_round, self.last_round):
             print('round', round+1)
             clients_trn_loss, clients_trn_top1, clients_trn_top5, clients_val_loss, clients_val_top1, clients_val_top5, clients_lr = AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter(), AverageMeter()
@@ -272,12 +299,23 @@ class CommonwealthMachine:
                     )
                 else:
                     new_weight_fedavg = average_weights(clients_params_arr, clients_data_w)
+                    if use_fedweit and fedweit_personal_keys:
+                        for key in fedweit_personal_keys:
+                            new_weight_fedavg.pop(key, None)
                     server_dict = self.global_run_manager.net.module.state_dict()
                     server_dict.update(new_weight_fedavg)
                     self.global_run_manager.net.module.load_state_dict(server_dict)
                     global_state = self.global_run_manager.net.module.state_dict()
                     for idx in self.clients_idx_arr:
-                        self.clients[idx].net.module.load_state_dict(global_state, strict=False)
+                        if use_fedweit and fedweit_personal_keys:
+                            local_state = self.clients[idx].net.module.state_dict()
+                            merged_state = copy.deepcopy(global_state)
+                            for key in fedweit_personal_keys:
+                                if key in local_state:
+                                    merged_state[key] = local_state[key]
+                            self.clients[idx].net.module.load_state_dict(merged_state, strict=False)
+                        else:
+                            self.clients[idx].net.module.load_state_dict(global_state, strict=False)
                     global_checkpoint = {
                         "round": round,
                         "state_dict": self.global_run_manager.net.module.state_dict(),
@@ -290,6 +328,56 @@ class CommonwealthMachine:
                     )
                     checkpoint_io_time += time.time() - global_ckpt_io_start
                 aggregation_time += time.time() - aggregation_start
+            if use_ditto and ditto_personal_states is not None:
+                ditto_personal_start = time.time()
+                global_reference_state = copy.deepcopy(self.global_run_manager.net.module.state_dict())
+                for pos, idx in enumerate(self.clients_idx_arr):
+                    self.clients[idx].net.module.load_state_dict(ditto_personal_states[pos], strict=False)
+                    p_trn_loss, p_trn_top1, p_trn_top5, p_val_loss, p_val_top1, p_val_top5, p_lr = self.clients[idx].train_run_manager(
+                        start_local_epoch=start_local_epoch,
+                        last_local_epoch=last_local_epoch,
+                        server_model=None,
+                        writer=self.writerTf,
+                        global_round_idx=round + 1,
+                        preserve_local_model=True,
+                        prox_reference_state=global_reference_state,
+                        prox_mu=ditto_mu,
+                    )
+                    ditto_personal_states[pos] = copy.deepcopy(self.clients[idx].net.module.state_dict())
+                    self.write_log(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                        + " ditto_personal client{} round{} trn_loss {:.4f}, trn_top1 {:.4f}, val_loss {:.4f}, val_top1 {:.4f}, lr {:.4f}".format(
+                            idx,
+                            round + 1,
+                            p_trn_loss,
+                            p_trn_top1,
+                            p_val_loss,
+                            p_val_top1,
+                            p_lr,
+                        ),
+                        prefix="retrain",
+                    )
+                    self._append_per_client_metric(
+                        round,
+                        idx,
+                        ditto_personal=True,
+                        trn_loss=float(p_trn_loss),
+                        trn_top1=float(p_trn_top1),
+                        trn_top5=float(p_trn_top5),
+                        val_loss=float(p_val_loss),
+                        val_top1=float(p_val_top1),
+                        val_top5=float(p_val_top5),
+                        lr=float(p_lr),
+                    )
+                    client_checkpoint = {
+                        "round": round,
+                        "state_dict": self.clients[idx].net.module.state_dict(),
+                        f"{idx}_weight_optimizer": self.clients[idx].optimizer.state_dict(),
+                    }
+                    ditto_ckpt_start = time.time()
+                    self.clients[idx].save_model(client_checkpoint, is_best=False)
+                    checkpoint_io_time += time.time() - ditto_ckpt_start
+                local_compute_time += time.time() - ditto_personal_start
             self.writerTf.add_scalar('clients_trn_loss', clients_trn_loss.avg, round)
             self.writerTf.add_scalar('clients_trn_top1', clients_trn_top1.avg, round)
             self.writerTf.add_scalar('clients_trn_top5', clients_trn_top5.avg, round)
@@ -306,7 +394,6 @@ class CommonwealthMachine:
                     clients_lr.avg,
                     round_time_use),
                 prefix='retrain')
-            # personalized retrain: no federated aggregation in this stage
             evaluation_start = time.time()
             avg_test_loss, avg_test_top1, avg_test_top5 = self.test_inference(
                 tag="learned_net",

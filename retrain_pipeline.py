@@ -128,6 +128,60 @@ def _load_client_subnet_artifact(artifact_path: str):
     return subnet, net_config
 
 
+def _normalize_baseline_method(method_name: str) -> str:
+    method = str(method_name or "fedavg").strip().lower().replace("-", "_")
+    aliases = {
+        "fedavg": "fedavg",
+        "target": "target",
+        "refed": "re_fed",
+        "re_fed": "re_fed",
+        "ditto": "ditto",
+        "fedweit": "fedweit",
+    }
+    if method not in aliases:
+        raise ValueError(
+            f"unsupported baseline_method={method_name}, expected one of: "
+            f"{', '.join(sorted(set(aliases.values())))}"
+        )
+    return aliases[method]
+
+
+def _configure_baseline_method(args):
+    method = _normalize_baseline_method(getattr(args, "baseline_method", "fedavg"))
+    auto_cfg = bool(getattr(args, "baseline_auto_config", True))
+    args.baseline_method = method
+    # baseline 对照组均采用 FedAvg 全局聚合（个性化方法在其上做附加约束）
+    args.retrain_fedavg = True
+
+    if method in {"re_fed", "target"} and auto_cfg:
+        args.enable_replay = True
+        if str(getattr(args, "replay_mode", "none")).lower() == "none":
+            args.replay_mode = str(getattr(args, "baseline_replay_mode", "task_balanced"))
+        if (
+            int(getattr(args, "replay_capacity", 0)) <= 0
+            and getattr(args, "replay_capacity_ratio", None) is None
+        ):
+            args.replay_capacity_ratio = float(getattr(args, "baseline_replay_capacity_ratio", 0.1))
+        if int(getattr(args, "replay_per_batch", 0)) <= 0:
+            args.replay_per_batch = int(getattr(args, "baseline_replay_per_batch", 32))
+
+    if method == "target" and auto_cfg:
+        args.enable_kd = True
+        if str(getattr(args, "cl_kd_method", "none")).lower() == "none":
+            args.cl_kd_method = str(getattr(args, "baseline_target_kd_method", "logit"))
+        if float(getattr(args, "cl_kd_logit_lambda", 0.0)) <= 0:
+            args.cl_kd_logit_lambda = float(getattr(args, "baseline_target_kd_lambda", 1.0))
+        if float(getattr(args, "cl_kd_temperature", 0.0)) <= 0:
+            args.cl_kd_temperature = float(getattr(args, "baseline_target_kd_temperature", 2.0))
+
+    if method == "ditto":
+        args.ditto_mu = float(getattr(args, "ditto_mu", 0.01))
+        if args.ditto_mu <= 0:
+            raise ValueError("ditto_mu must be > 0 when baseline_method=ditto")
+
+    return method
+
+
 def run_supernet_retrain_pipeline(
     args,
     task_id: int,
@@ -500,9 +554,13 @@ def run_baseline_retrain_pipeline(
     auto_resume_manager,
     helpers: RetrainPipelineHelpers,
 ):
+    baseline_method = _configure_baseline_method(args)
+    print(
+        f"[Baseline] method={baseline_method}, retrain_fedavg={args.retrain_fedavg}, "
+        f"enable_replay={getattr(args, 'enable_replay', False)}, "
+        f"enable_kd={getattr(args, 'enable_kd', False)}"
+    )
     args.search = False
-    # baseline 对照组使用标准 FedAvg 聚合
-    args.retrain_fedavg = True
     retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
     retrain_run_config_kwargs = _build_retrain_run_config_kwargs(args, retrain_last_round)
     args.client_id = 0

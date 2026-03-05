@@ -98,7 +98,15 @@ class CommonwealthMachine:
             return {"global_norm": 0.0, "global_mean": 0.0, "global_std": 0.0, "classifier_norm": 0.0}
         flat = torch.cat(floating)
         classifier_norm = 0.0
-        for key in ["classifier.linear.weight", "classifier.weight", "linear.weight", "fc.weight"]:
+        for key in [
+            "classifier.linear.weight",
+            "classifier.weight",
+            "classifier.1.weight",
+            "backbone.classifier.1.weight",
+            "linear.weight",
+            "fc.weight",
+            "backbone.fc.weight",
+        ]:
             if key in state and torch.is_tensor(state[key]):
                 classifier_norm = float(state[key].float().norm())
                 break

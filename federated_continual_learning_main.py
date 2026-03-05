@@ -668,7 +668,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_worker", type=int, default=2,help="number of workers during data loading")  # 1 is most stable. 2 or 4 is bad. 3 is also ok.
     parser.add_argument("--search", action="store_true", help="use it in search")
     parser.add_argument("--baseline_arch", type=str, default="resnet18",
-                        help="fixed backbone name in torchvision.models, e.g. resnet18/resnet34/resnet50")
+                        help="fixed backbone name in torchvision.models, e.g. resnet18/resnet34/resnet50/mobilenet_v2")
     parser.add_argument("--baseline_pretrained", action="store_true",
                         help="use torchvision pretrained weights for baseline backbones")
     parser.add_argument("--baseline_method", type=str, default="fedavg",
@@ -693,7 +693,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ditto_mu", type=float, default=0.01,
                         help="baseline_method=ditto 时的 proximal 正则系数")
     parser.add_argument("--fedweit_personal_keys", type=str,
-                        default="backbone.fc.weight,backbone.fc.bias,fc.weight,fc.bias,classifier.weight,classifier.bias,linear.weight,linear.bias",
+                        default="backbone.fc.weight,backbone.fc.bias,fc.weight,fc.bias,classifier.weight,classifier.bias,classifier.1.weight,classifier.1.bias,backbone.classifier.1.weight,backbone.classifier.1.bias,linear.weight,linear.bias",
                         help="baseline_method=fedweit 时不参与全局聚合、保持客户端个性化的参数键（逗号分隔）")
 
     # supernet config（看代码细节了解搜索空间的工作原理）

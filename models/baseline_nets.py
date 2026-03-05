@@ -1,5 +1,3 @@
-import copy
-
 import torch.nn as nn
 from torchvision import models
 
@@ -8,7 +6,8 @@ from utils.my_modules import MyNetwork
 
 class BaselineResNet(MyNetwork):
     """
-    轻量封装 torchvision ResNet，使其符合 RunManager 所需接口。
+    轻量封装 torchvision 分类骨干网络（当前重点支持 resnet* / mobilenet_v2），
+    使其符合 RunManager 所需接口。
     """
 
     def __init__(self, arch: str = "resnet18", num_classes: int = 100, pretrained: bool = False):
@@ -16,21 +15,70 @@ class BaselineResNet(MyNetwork):
         if not hasattr(models, arch):
             raise ValueError(f"torchvision.models 中不存在 {arch}")
         builder = getattr(models, arch)
-        try:
-            self.backbone = builder(weights="IMAGENET1K_V1" if pretrained else None)
-        except TypeError:
-            # 兼容旧版 torchvision
-            self.backbone = builder(pretrained=pretrained)
-
-        # 替换分类头
-        if not hasattr(self.backbone, "fc"):
-            raise ValueError(f"{arch} 缺少 fc 层，当前 baseline 仅支持标准 ResNet")
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_features, num_classes)
+        self.backbone = self._build_backbone(builder, arch, pretrained)
+        self._replace_classifier_head(self.backbone, arch, num_classes)
 
         self.arch = arch
         self.num_classes = num_classes
         self.pretrained = pretrained
+
+    @staticmethod
+    def _build_backbone(builder, arch: str, pretrained: bool):
+        if pretrained:
+            # 新版 torchvision 的 enum 权重优先；映射不到时回退到旧接口。
+            enum_name_map = {
+                "resnet18": "ResNet18_Weights",
+                "resnet34": "ResNet34_Weights",
+                "resnet50": "ResNet50_Weights",
+                "mobilenet_v2": "MobileNet_V2_Weights",
+            }
+            enum_name = enum_name_map.get(arch)
+            if enum_name is not None and hasattr(models, enum_name):
+                try:
+                    enum_cls = getattr(models, enum_name)
+                    return builder(weights=enum_cls.DEFAULT)
+                except Exception:
+                    pass
+            for kwargs in ({"weights": "IMAGENET1K_V1"}, {"pretrained": True}, {}):
+                try:
+                    return builder(**kwargs)
+                except Exception:
+                    continue
+            raise RuntimeError(f"无法构建 pretrained backbone: {arch}")
+
+        for kwargs in ({"weights": None}, {"pretrained": False}, {}):
+            try:
+                return builder(**kwargs)
+            except Exception:
+                continue
+        raise RuntimeError(f"无法构建 backbone: {arch}")
+
+    @staticmethod
+    def _replace_classifier_head(backbone, arch: str, num_classes: int):
+        # ResNet 系列：backbone.fc
+        if hasattr(backbone, "fc") and isinstance(backbone.fc, nn.Linear):
+            in_features = backbone.fc.in_features
+            backbone.fc = nn.Linear(in_features, num_classes)
+            return
+
+        # MobileNet / EfficientNet 系列：backbone.classifier
+        if hasattr(backbone, "classifier"):
+            classifier = backbone.classifier
+            if isinstance(classifier, nn.Linear):
+                in_features = classifier.in_features
+                backbone.classifier = nn.Linear(in_features, num_classes)
+                return
+            if isinstance(classifier, nn.Sequential):
+                for idx in range(len(classifier) - 1, -1, -1):
+                    if isinstance(classifier[idx], nn.Linear):
+                        in_features = classifier[idx].in_features
+                        classifier[idx] = nn.Linear(in_features, num_classes)
+                        return
+
+        raise ValueError(
+            f"{arch} 缺少可替换的分类头（fc/classifier），"
+            "当前 baseline 仅支持标准分类骨干（如 resnet* / mobilenet_v2）"
+        )
 
     def forward(self, x):
         return self.backbone(x)

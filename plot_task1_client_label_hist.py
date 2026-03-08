@@ -219,19 +219,44 @@ def save_figure(
     ax.spines["left"].set_visible(False)
     ax.spines["bottom"].set_visible(False)
 
-    # 图例按任务内类别编号 0~9 显示
-    legend_ncol = min(5, max(1, len(task_classes)))
+    # 图例按任务内类别编号 0~9 显示，并固定为两行：0-4 / 5-9
+    handles, labels = ax.get_legend_handles_labels()
+    pairs = sorted(zip(handles, labels), key=lambda p: int(p[1]))
+
+    legend_ncol = min(5, max(1, len(pairs)))
+    n_items = len(pairs)
+    n_rows = int(np.ceil(n_items / legend_ncol))
+
+    # Matplotlib 多列图例常按“列优先”排布；这里重排成视觉“行优先”（左到右）
+    row_major = pairs
+    col_major_input = [None] * n_items
+    for r in range(n_rows):
+        for c in range(legend_ncol):
+            d_idx = r * legend_ncol + c
+            s_idx = c * n_rows + r
+            if d_idx < n_items and s_idx < n_items:
+                col_major_input[s_idx] = row_major[d_idx]
+    col_major_input = [p for p in col_major_input if p is not None]
+    legend_handles = [p[0] for p in col_major_input]
+    legend_labels = [p[1] for p in col_major_input]
+
     ax.legend(
+        legend_handles,
+        legend_labels,
         title=None,
         ncol=legend_ncol,
         fontsize=10,
-        loc="upper right",
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.02),
         framealpha=1.0,
         facecolor="white",
         edgecolor="#DDDDDD",
+        handlelength=1.1,
+        handletextpad=0.35,
+        columnspacing=1.0,
     )
 
-    fig.tight_layout(pad=0.8)
+    fig.tight_layout(rect=[0, 0, 1, 0.93], pad=0.8)
     fig.savefig(out_file, dpi=400, bbox_inches="tight")
     plt.close(fig)
 

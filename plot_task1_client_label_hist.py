@@ -140,8 +140,6 @@ def save_figure(
             f"matplotlib import failed: {exc}. Please install matplotlib in current env."
         )
 
-    plt.style.use("ggplot")
-
     # 尝试启用中文字体；若系统无中文字体则回退到英文标签
     cn_candidates = [
         "SimHei",
@@ -166,10 +164,25 @@ def save_figure(
     x = np.arange(n_clients)
     width = 0.72
 
+    # 论文友好的柔和配色（10色）
+    palette = [
+        "#4E79A7",  # blue
+        "#F28E2B",  # orange
+        "#59A14F",  # green
+        "#E15759",  # red
+        "#B07AA1",  # purple
+        "#76B7B2",  # cyan
+        "#EDC948",  # yellow
+        "#9C755F",  # brown
+        "#BAB0AC",  # gray
+        "#2F4B7C",  # deep blue
+    ]
+
     fig_w = max(11, int(1.2 * n_clients))
-    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 6.5), squeeze=True)
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 6.2), squeeze=True)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
     bottom = np.zeros(n_clients, dtype=float)
-    colors = plt.get_cmap("tab10").colors
 
     for j, cls in enumerate(task_classes):
         y = np.asarray([client_counts[cid][cls] for cid in client_ids], dtype=float)
@@ -178,46 +191,48 @@ def save_figure(
             y,
             width=width,
             bottom=bottom,
-            color=colors[j % len(colors)],
-            label=str(cls),
+            color=palette[j % len(palette)],
+            label=str(j),  # 图例固定为 0~9（任务内类别编号）
             edgecolor="none",
         )
         bottom += y
 
     if use_chinese:
         xlabels = [f"客户端{cid}" for cid in client_ids]
-        xlabel = "客户端"
-        ylabel = "样本数"
-        data_scope = "训练+验证" if include_val else "仅训练"
-        title = f"{mode_title} | 任务{task_id} | {data_scope}标签分布（堆叠柱状图）"
     else:
         xlabels = [f"Client {cid}" for cid in client_ids]
-        xlabel = "Clients"
-        ylabel = "Count"
-        data_scope = "train+val" if include_val else "train"
-        title = f"{mode_title} | Task {task_id} | {data_scope} label histogram (stacked)"
 
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, rotation=0, fontsize=11)
-    ax.set_xlabel(xlabel, fontsize=12)
-    ax.set_ylabel(ylabel, fontsize=12)
-    ax.set_title(title, fontsize=14, pad=10)
-    ax.grid(axis="y", alpha=0.35)
+    # 按要求去掉标题与横纵轴名称
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+
+    # 仅保留纵向（y轴）平行细线
+    ax.grid(axis="y", color="#D9D9D9", linewidth=0.8, alpha=0.9)
+    ax.grid(False, axis="x")
     ax.set_axisbelow(True)
 
-    # 图例按类别显示，放在右上区域，尽量贴近你给的示例风格
+    # 去掉四边框，视觉更干净
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.spines["bottom"].set_visible(False)
+
+    # 图例按任务内类别编号 0~9 显示
     legend_ncol = min(5, max(1, len(task_classes)))
     ax.legend(
-        title=("类别" if use_chinese else "Class"),
+        title=None,
         ncol=legend_ncol,
         fontsize=10,
-        title_fontsize=10,
         loc="upper right",
-        framealpha=0.9,
+        framealpha=1.0,
+        facecolor="white",
+        edgecolor="#DDDDDD",
     )
 
-    fig.tight_layout()
-    fig.savefig(out_file, dpi=200)
+    fig.tight_layout(pad=0.8)
+    fig.savefig(out_file, dpi=400, bbox_inches="tight")
     plt.close(fig)
 
 

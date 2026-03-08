@@ -152,6 +152,9 @@ def build_arch_prior_weights(
     history_protos: Dict[int, torch.Tensor],
     topk: int,
     tau: float,
+    min_similarity: Optional[float] = None,
+    uniform_mix: float = 0.0,
+    min_weight: float = 0.0,
 ) -> Tuple[List[int], Optional[torch.Tensor]]:
     similarity_scores = compute_similarity_scores(current_proto, history_protos)
     if len(similarity_scores) == 0:
@@ -159,10 +162,35 @@ def build_arch_prior_weights(
 
     sorted_pairs = sorted(similarity_scores.items(), key=lambda item: item[1], reverse=True)
     selected_pairs = sorted_pairs[: max(1, min(int(topk), len(sorted_pairs)))]
+    if min_similarity is not None:
+        selected_pairs = [
+            (task_id, score) for task_id, score in selected_pairs if float(score) >= float(min_similarity)
+        ]
+    if len(selected_pairs) == 0:
+        return [], None
+
     selected_task_ids = [task_id for task_id, _ in selected_pairs]
     score_tensor = torch.tensor([score for _, score in selected_pairs], dtype=torch.float32)
     tau_value = float(tau) if float(tau) > 0 else 1.0
     weights = torch.softmax(score_tensor / tau_value, dim=0)
+
+    min_weight_value = max(0.0, float(min_weight))
+    if min_weight_value > 0:
+        keep_mask = weights >= min_weight_value
+        if torch.any(keep_mask):
+            kept_indices = torch.nonzero(keep_mask, as_tuple=False).reshape(-1).tolist()
+            selected_task_ids = [selected_task_ids[idx] for idx in kept_indices]
+            weights = weights[keep_mask]
+            weights = weights / torch.clamp(weights.sum(), min=1e-12)
+        else:
+            return [], None
+
+    uniform_mix_value = min(max(float(uniform_mix), 0.0), 1.0)
+    if uniform_mix_value > 0 and weights.numel() > 0:
+        uniform_weights = torch.full_like(weights, 1.0 / float(weights.numel()))
+        weights = (1.0 - uniform_mix_value) * weights + uniform_mix_value * uniform_weights
+        weights = weights / torch.clamp(weights.sum(), min=1e-12)
+
     return selected_task_ids, weights
 
 

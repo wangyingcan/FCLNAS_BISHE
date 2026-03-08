@@ -140,8 +140,11 @@ def save_figure(
             f"matplotlib import failed: {exc}. Please install matplotlib in current env."
         )
 
-    # 尝试启用中文字体；若系统无中文字体则回退到英文标签
+    # 尝试启用中文字体（优先宋体）；若系统无对应字体则回退
     cn_candidates = [
+        "Songti SC",
+        "STSong",
+        "SimSun",
         "SimHei",
         "Microsoft YaHei",
         "PingFang SC",
@@ -178,8 +181,8 @@ def save_figure(
         "#2F4B7C",  # deep blue
     ]
 
-    fig_w = max(11, int(1.2 * n_clients))
-    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 6.2), squeeze=True)
+    fig_w = max(12, int(1.35 * n_clients))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 7.0), squeeze=True)
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
     bottom = np.zeros(n_clients, dtype=float)
@@ -203,7 +206,8 @@ def save_figure(
         xlabels = [f"Client {cid}" for cid in client_ids]
 
     ax.set_xticks(x)
-    ax.set_xticklabels(xlabels, rotation=0, fontsize=11)
+    ax.set_xticklabels(xlabels, rotation=0, fontsize=17)
+    ax.tick_params(axis="y", labelsize=16)
     # 按要求去掉标题与横纵轴名称
     ax.set_xlabel("")
     ax.set_ylabel("")
@@ -245,18 +249,19 @@ def save_figure(
         legend_labels,
         title=None,
         ncol=legend_ncol,
-        fontsize=10,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.02),
+        fontsize=14,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
         framealpha=1.0,
         facecolor="white",
         edgecolor="#DDDDDD",
         handlelength=1.1,
         handletextpad=0.35,
         columnspacing=1.0,
+        borderaxespad=0.0,
     )
 
-    fig.tight_layout(rect=[0, 0, 1, 0.93], pad=0.8)
+    fig.tight_layout(rect=[0, 0, 0.82, 1], pad=1.0)
     fig.savefig(out_file, dpi=400, bbox_inches="tight")
     plt.close(fig)
 

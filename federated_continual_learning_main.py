@@ -150,7 +150,7 @@ def load_prev_task(super_net, prev_task_path: str):
     return False
 
 
-def load_task1_bootstrap(super_net, bootstrap_ckpt_path: str):
+def load_task1_bootstrap(super_net, bootstrap_ckpt_path: str, load_arch_params: bool = False):
     """
     仅用于 task1：从外部超网 checkpoint 初始化 supernet。
     支持 `{"state_dict": ...}` 或直接 state_dict 结构。
@@ -164,10 +164,17 @@ def load_task1_bootstrap(super_net, bootstrap_ckpt_path: str):
     try:
         checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
         state_dict = checkpoint.get("state_dict", checkpoint)
+        if not bool(load_arch_params):
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if "AP_path_alpha" not in key and "AP_path_wb" not in key
+            }
         model_dict = super_net.state_dict()
         model_dict.update(state_dict)
         super_net.load_state_dict(model_dict)
-        print(f"[FCL] Loaded task1 bootstrap supernet from {ckpt_path}")
+        mode_desc = "weights+arch" if bool(load_arch_params) else "weights-only"
+        print(f"[FCL] Loaded task1 bootstrap supernet from {ckpt_path} ({mode_desc})")
         return True
     except Exception as e:
         print(f"[FCL] Failed to load task1 bootstrap supernet from {ckpt_path}: {e}")
@@ -388,6 +395,9 @@ def run_nas_search_for_task(
                     history.task_prototypes,
                     topk=getattr(args, "arch_prior_topk", 3),
                     tau=getattr(args, "arch_prior_tau", 1.0),
+                    min_similarity=getattr(args, "arch_prior_min_similarity", None),
+                    uniform_mix=getattr(args, "arch_prior_uniform_mix", 0.0),
+                    min_weight=getattr(args, "arch_prior_min_weight", 0.0),
                 )
                 fused_arch_params = build_fused_arch_parameters(
                     history.arch_parameters,
@@ -431,6 +441,10 @@ def run_nas_search_for_task(
                         "similarity_scores": {int(k): float(v) for k, v in similarity_scores.items()},
                         "topk": int(getattr(args, "arch_prior_topk", 3)),
                         "tau": float(getattr(args, "arch_prior_tau", 1.0)),
+                        "min_similarity": getattr(args, "arch_prior_min_similarity", None),
+                        "uniform_mix": float(getattr(args, "arch_prior_uniform_mix", 0.0)),
+                        "min_weight": float(getattr(args, "arch_prior_min_weight", 0.0)),
+                        "prior_applied": bool(fused_arch_params is not None),
                         "enable_arch_prior_loss": bool(getattr(args, "enable_arch_prior_loss", False)),
                         "arch_prior_loss_lambda": float(getattr(args, "arch_prior_loss_lambda", 0.0)),
                         "alpha_before_stats": summarize_arch_parameters(clone_arch_parameters(client.net)),
@@ -575,6 +589,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path", type=str, default="./output/proxyless-", help="checkpoint save path")
     parser.add_argument("--task1_bootstrap_ckpt", type=str, default="./global.pth.tar",
                         help="task1 启动时的超网初始化 checkpoint 路径；文件存在时自动加载，仅作用于 task1")
+    parser.add_argument("--task1_bootstrap_load_arch_params", type=parse_optional_bool, nargs="?", const=True, default=False,
+                        help="task1 从 bootstrap ckpt 初始化时是否加载架构参数(AP_path_alpha/AP_path_wb)；默认 False（仅加载权重）")
     parser.add_argument("--save_env", type=str, default="EXP", help="experiment time name to save exp code")
     parser.add_argument("--resume", action="store_true", help="load last checkpoint")
     parser.add_argument("-R", "--auto_resume", action="store_true",
@@ -596,6 +612,12 @@ def parse_args() -> argparse.Namespace:
                         help="历史先验 Top-K 任务数")
     parser.add_argument("--arch_prior_tau", type=float, default=0.5,
                         help="历史先验 softmax 温度参数")
+    parser.add_argument("--arch_prior_min_similarity", type=float, default=None,
+                        help="历史先验候选最小相似度阈值；低于该值的历史任务不参与融合，默认不启用")
+    parser.add_argument("--arch_prior_uniform_mix", type=float, default=0.0,
+                        help="历史先验融合时加入均匀分布的混合系数(0~1)，提高稳健性；默认 0")
+    parser.add_argument("--arch_prior_min_weight", type=float, default=0.0,
+                        help="历史先验 softmax 后最小权重阈值；低于阈值的历史任务被剔除，默认 0")
     parser.add_argument("--enable_arch_prior_loss", action="store_true",
                         help="是否在搜索阶段的架构参数更新中加入与历史先验偏移的正则项，默认关闭")
     parser.add_argument("--arch_prior_loss_lambda", type=float, default=0.0,
@@ -750,6 +772,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch_weight_decay", type=float, default=0,help="weight decay for architecture parameters")
     parser.add_argument("--target_hardware", type=str, default=None,
                         choices=["mobile", "cpu", "gpu8", None, "flops"],help="target hardware for architecture search")
+    parser.add_argument("--use_hardware_constraint", type=parse_optional_bool, nargs="?", const=True, default=True,
+                        help="搜索阶段是否启用硬件约束(时延/FLOPs)参与架构更新；默认 True")
 
     # Grad hyper-parameters
     parser.add_argument("--grad_update_arch_param_every", type=int, default=5,help="update architecture parameters every N steps")
@@ -1307,7 +1331,11 @@ def main():
         task1_bootstrap_ckpt_path = None
         if task_id == 1:
             task1_bootstrap_ckpt_path = os.path.abspath(getattr(args, "task1_bootstrap_ckpt", "./global.pth.tar"))
-            loaded_task1_bootstrap = load_task1_bootstrap(super_net, task1_bootstrap_ckpt_path)
+            loaded_task1_bootstrap = load_task1_bootstrap(
+                super_net,
+                task1_bootstrap_ckpt_path,
+                load_arch_params=bool(getattr(args, "task1_bootstrap_load_arch_params", False)),
+            )
         if task_id > 1:
             loaded_prev_supernet = load_prev_task(super_net, prev_task_path)
         inherited_supernet = loaded_prev_supernet or loaded_task1_bootstrap
@@ -1324,6 +1352,7 @@ def main():
                 "loaded_prev_supernet": loaded_prev_supernet,
                 "loaded_task1_bootstrap": loaded_task1_bootstrap,
                 "task1_bootstrap_ckpt_path": task1_bootstrap_ckpt_path,
+                "task1_bootstrap_load_arch_params": bool(getattr(args, "task1_bootstrap_load_arch_params", False)),
                 "signature": model_signature(super_net),
             }) + "\n")
         base_supernet_state = copy.deepcopy(super_net.state_dict())
@@ -1335,8 +1364,11 @@ def main():
         else:
             args.arch_opt_param = None
 
-        args.ref_value = None if args.target_hardware is None else \
-            REF_VALUES[args.target_hardware]["%.2f" % args.width_mult]
+        if not bool(getattr(args, "use_hardware_constraint", True)):
+            args.ref_value = None
+        else:
+            args.ref_value = None if args.target_hardware is None else \
+                REF_VALUES[args.target_hardware]["%.2f" % args.width_mult]
 
         if args.arch_algo == "grad":
             # grad 正则化参数
@@ -1395,9 +1427,13 @@ def main():
 
             # 每个 client 独立的搜索配置（含 target_hardware、ref_value）
             asc_local = copy.deepcopy(arch_search_config)
-            asc_local.target_hardware = set_target_hardware(idx=idx)
-            asc_local.ref_value = REF_VALUES[asc_local.target_hardware]["%.2f" % args.width_mult] \
-                if asc_local.target_hardware is not None else None
+            if bool(getattr(args, "use_hardware_constraint", True)):
+                asc_local.target_hardware = set_target_hardware(idx=idx)
+                asc_local.ref_value = REF_VALUES[asc_local.target_hardware]["%.2f" % args.width_mult] \
+                    if asc_local.target_hardware is not None else None
+            else:
+                asc_local.target_hardware = None
+                asc_local.ref_value = None
 
             # 记录不同类型 client 的索引
             all_client_idx_arr.append(idx)

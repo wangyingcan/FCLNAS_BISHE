@@ -134,38 +134,89 @@ def save_figure(
 ):
     try:
         import matplotlib.pyplot as plt
+        from matplotlib import font_manager
     except Exception as exc:
         raise RuntimeError(
             f"matplotlib import failed: {exc}. Please install matplotlib in current env."
         )
 
-    n_clients = len(client_counts)
-    nrows, ncols = 2, 5
-    if n_clients != 10:
-        ncols = min(5, max(1, n_clients))
-        nrows = int(np.ceil(n_clients / ncols))
+    plt.style.use("ggplot")
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.8 * ncols, 3.6 * nrows), squeeze=False)
-    x = np.arange(len(task_classes))
-    xticklabels = [str(c) for c in task_classes]
+    # 尝试启用中文字体；若系统无中文字体则回退到英文标签
+    cn_candidates = [
+        "SimHei",
+        "Microsoft YaHei",
+        "PingFang SC",
+        "Noto Sans CJK SC",
+        "WenQuanYi Micro Hei",
+        "Heiti SC",
+        "Arial Unicode MS",
+    ]
+    installed_font_names = {f.name for f in font_manager.fontManager.ttflist}
+    use_chinese = False
+    for font_name in cn_candidates:
+        if font_name in installed_font_names:
+            plt.rcParams["font.sans-serif"] = [font_name, "DejaVu Sans"]
+            plt.rcParams["axes.unicode_minus"] = False
+            use_chinese = True
+            break
 
-    for i in range(nrows * ncols):
-        ax = axes[i // ncols][i % ncols]
-        if i >= n_clients:
-            ax.axis("off")
-            continue
-        counts = client_counts[i]
-        y = np.asarray([counts[c] for c in task_classes], dtype=int)
-        ax.bar(x, y)
-        ax.set_title(f"Client {i} (n={int(np.sum(y))})")
-        ax.set_xticks(x)
-        ax.set_xticklabels(xticklabels, rotation=45, fontsize=8)
-        ax.set_xlabel("Class ID")
-        ax.set_ylabel("Count")
+    client_ids = sorted(client_counts.keys())
+    n_clients = len(client_ids)
+    x = np.arange(n_clients)
+    width = 0.72
 
-    data_scope = "train+val" if include_val else "train"
-    fig.suptitle(f"{mode_title} | Task {task_id} | {data_scope} label histogram", fontsize=14)
-    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+    fig_w = max(11, int(1.2 * n_clients))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, 6.5), squeeze=True)
+    bottom = np.zeros(n_clients, dtype=float)
+    colors = plt.get_cmap("tab10").colors
+
+    for j, cls in enumerate(task_classes):
+        y = np.asarray([client_counts[cid][cls] for cid in client_ids], dtype=float)
+        ax.bar(
+            x,
+            y,
+            width=width,
+            bottom=bottom,
+            color=colors[j % len(colors)],
+            label=str(cls),
+            edgecolor="none",
+        )
+        bottom += y
+
+    if use_chinese:
+        xlabels = [f"客户端{cid}" for cid in client_ids]
+        xlabel = "客户端"
+        ylabel = "样本数"
+        data_scope = "训练+验证" if include_val else "仅训练"
+        title = f"{mode_title} | 任务{task_id} | {data_scope}标签分布（堆叠柱状图）"
+    else:
+        xlabels = [f"Client {cid}" for cid in client_ids]
+        xlabel = "Clients"
+        ylabel = "Count"
+        data_scope = "train+val" if include_val else "train"
+        title = f"{mode_title} | Task {task_id} | {data_scope} label histogram (stacked)"
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(xlabels, rotation=0, fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_title(title, fontsize=14, pad=10)
+    ax.grid(axis="y", alpha=0.35)
+    ax.set_axisbelow(True)
+
+    # 图例按类别显示，放在右上区域，尽量贴近你给的示例风格
+    legend_ncol = min(5, max(1, len(task_classes)))
+    ax.legend(
+        title=("类别" if use_chinese else "Class"),
+        ncol=legend_ncol,
+        fontsize=10,
+        title_fontsize=10,
+        loc="upper right",
+        framealpha=0.9,
+    )
+
+    fig.tight_layout()
     fig.savefig(out_file, dpi=200)
     plt.close(fig)
 

@@ -206,8 +206,8 @@ def save_figure(
         xlabels = [f"Client {cid}" for cid in client_ids]
 
     ax.set_xticks(x)
-    ax.set_xticklabels(xlabels, rotation=0, fontsize=17)
-    ax.tick_params(axis="y", labelsize=16)
+    ax.set_xticklabels(xlabels, rotation=22, ha="right", fontsize=13)
+    ax.tick_params(axis="y", labelsize=14)
     # 按要求去掉标题与横纵轴名称
     ax.set_xlabel("")
     ax.set_ylabel("")
@@ -250,18 +250,18 @@ def save_figure(
         title=None,
         ncol=legend_ncol,
         fontsize=14,
-        loc="upper left",
-        bbox_to_anchor=(1.01, 1.0),
+        loc="upper right",
+        bbox_to_anchor=(1.0, 1.0),
         framealpha=1.0,
         facecolor="white",
         edgecolor="#DDDDDD",
         handlelength=1.1,
         handletextpad=0.35,
         columnspacing=1.0,
-        borderaxespad=0.0,
+        borderaxespad=0.2,
     )
 
-    fig.tight_layout(rect=[0, 0, 0.82, 1], pad=1.0)
+    fig.tight_layout(rect=[0, 0.02, 1, 1], pad=1.0)
     fig.savefig(out_file, dpi=400, bbox_inches="tight")
     plt.close(fig)
 

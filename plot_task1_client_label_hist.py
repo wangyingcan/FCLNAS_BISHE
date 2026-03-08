@@ -166,6 +166,12 @@ def save_figure(
     n_clients = len(client_ids)
     x = np.arange(n_clients)
     width = 0.72
+    # 字体大小/图例位置调节入口
+    x_tick_fontsize = 13
+    y_tick_fontsize = 14
+    legend_fontsize = 13
+    legend_anchor_x = 1.0
+    legend_anchor_y = 1.02
 
     # 论文友好的柔和配色（10色）
     palette = [
@@ -205,9 +211,17 @@ def save_figure(
     else:
         xlabels = [f"Client {cid}" for cid in client_ids]
 
+    # 强制常规字形，避免倾斜字体
+    plt.rcParams["font.style"] = "normal"
     ax.set_xticks(x)
-    ax.set_xticklabels(xlabels, rotation=22, ha="right", fontsize=13)
-    ax.tick_params(axis="y", labelsize=14)
+    ax.set_xticklabels(
+        xlabels,
+        rotation=0,
+        ha="center",
+        fontsize=x_tick_fontsize,
+        fontstyle="normal",
+    )
+    ax.tick_params(axis="y", labelsize=y_tick_fontsize)
     # 按要求去掉标题与横纵轴名称
     ax.set_xlabel("")
     ax.set_ylabel("")
@@ -249,16 +263,16 @@ def save_figure(
         legend_labels,
         title=None,
         ncol=legend_ncol,
-        fontsize=14,
-        loc="upper right",
-        bbox_to_anchor=(1.0, 1.0),
+        fontsize=legend_fontsize,
+        loc="lower right",
+        bbox_to_anchor=(legend_anchor_x, legend_anchor_y),
         framealpha=1.0,
         facecolor="white",
         edgecolor="#DDDDDD",
         handlelength=1.1,
         handletextpad=0.35,
         columnspacing=1.0,
-        borderaxespad=0.2,
+        borderaxespad=0.0,
     )
 
     fig.tight_layout(rect=[0, 0.02, 1, 1], pad=1.0)

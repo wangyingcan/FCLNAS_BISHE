@@ -706,8 +706,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline_pretrained", action="store_true",
                         help="use torchvision pretrained weights for baseline backbones")
     parser.add_argument("--baseline_method", type=str, default="fedavg",
-                        choices=["fedavg", "target", "re_fed", "ditto", "fedweit", "re-fed"],
-                        help="baseline 策略：fedavg / target / re_fed / ditto / fedweit")
+                        choices=["fedavg", "target", "re_fed", "ditto", "fedweit", "fedta", "af_fcl", "affcl", "re-fed", "af-fcl"],
+                        help="baseline 策略：fedavg / target / re_fed / ditto / fedweit / fedta / af_fcl")
     parser.add_argument("--baseline_auto_config", type=parse_optional_bool, nargs="?", const=True, default=True,
                         help="是否对 baseline_method 自动填充推荐超参（replay/KD 等），默认 True")
     parser.add_argument("--baseline_replay_mode", type=str, default="task_balanced",
@@ -729,6 +729,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fedweit_personal_keys", type=str,
                         default="backbone.fc.weight,backbone.fc.bias,fc.weight,fc.bias,classifier.weight,classifier.bias,classifier.1.weight,classifier.1.bias,backbone.classifier.1.weight,backbone.classifier.1.bias,linear.weight,linear.bias",
                         help="baseline_method=fedweit 时不参与全局聚合、保持客户端个性化的参数键（逗号分隔）")
+    parser.add_argument("--fedta_tail_ratio", type=float, default=0.4,
+                        help="baseline_method=fedta 时，按本地类别频次选择尾部类别的比例（0~1）")
+    parser.add_argument("--fedta_anchor_lambda", type=float, default=0.5,
+                        help="baseline_method=fedta 时 Tail Anchor 蒸馏损失权重")
+    parser.add_argument("--fedta_temperature", type=float, default=2.0,
+                        help="baseline_method=fedta 时 Tail Anchor 蒸馏温度")
+    parser.add_argument("--fedta_min_tail_classes", type=int, default=1,
+                        help="baseline_method=fedta 时最少尾部类别数")
+    parser.add_argument("--baseline_affcl_replay_mode", type=str, default="age_priority",
+                        choices=["none", "global", "task_balanced", "age_priority"],
+                        help="baseline_method=af_fcl 自动配置 replay 时使用的模式")
+    parser.add_argument("--baseline_affcl_replay_capacity_ratio", type=float, default=0.15,
+                        help="baseline_method=af_fcl 自动配置 replay 容量比例（仅在未手动设置 replay_capacity/replay_capacity_ratio 时生效）")
+    parser.add_argument("--baseline_affcl_replay_per_batch", type=int, default=32,
+                        help="baseline_method=af_fcl 自动配置每 batch 重放样本数（仅在 replay_per_batch<=0 时生效）")
+    parser.add_argument("--baseline_affcl_old_task_scale", type=float, default=1.2,
+                        help="baseline_method=af_fcl 自动配置旧任务样本采样放大系数（age_priority）")
+    parser.add_argument("--baseline_affcl_old_task_scale_by_f", type=float, default=2.0,
+                        help="baseline_method=af_fcl 自动配置按遗忘度放大采样系数")
+    parser.add_argument("--baseline_affcl_kd_method", type=str, default="logit",
+                        choices=["none", "logit", "logit_conf"],
+                        help="baseline_method=af_fcl 自动配置 KD 蒸馏方式")
+    parser.add_argument("--baseline_affcl_kd_lambda", type=float, default=0.5,
+                        help="baseline_method=af_fcl 自动配置 KD 权重（仅在 cl_kd_logit_lambda<=0 时生效）")
+    parser.add_argument("--baseline_affcl_kd_temperature", type=float, default=2.0,
+                        help="baseline_method=af_fcl 自动配置 KD 温度（仅在 cl_kd_temperature<=0 时生效）")
 
     # supernet config（看代码细节了解搜索空间的工作原理）
     parser.add_argument("--width_stages", type=str, default="24,40,80,96,192,320",
@@ -915,7 +941,7 @@ def main():
             setattr(args, k, base_val if override_val is None else override_val)
             
     def _attach_replay_cfg(run_cfg, a):
-        """将回放相关超参挂到 run_config 上，便于 RunManager 读取；支持按全训练集比例设定容量。"""
+        """将回放/元学习/基线附加超参挂到 run_config 上，便于 RunManager 读取。"""
         for k in [
             "replay_mode",
             "replay_capacity",
@@ -928,6 +954,11 @@ def main():
             "retrain_meta_noise_ratio",
             "retrain_meta_noise_std",
             "retrain_meta_use_kd",
+            "baseline_method",
+            "fedta_tail_ratio",
+            "fedta_anchor_lambda",
+            "fedta_temperature",
+            "fedta_min_tail_classes",
         ]:
             setattr(run_cfg, k, getattr(a, k, None))
         ratio = getattr(a, "replay_capacity_ratio", None)

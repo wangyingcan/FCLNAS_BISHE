@@ -141,6 +141,9 @@ def _normalize_baseline_method(method_name: str) -> str:
         "re_fed": "re_fed",
         "ditto": "ditto",
         "fedweit": "fedweit",
+        "fedta": "fedta",
+        "affcl": "af_fcl",
+        "af_fcl": "af_fcl",
     }
     if method not in aliases:
         raise ValueError(
@@ -182,6 +185,43 @@ def _configure_baseline_method(args):
         args.ditto_mu = float(getattr(args, "ditto_mu", 0.01))
         if args.ditto_mu <= 0:
             raise ValueError("ditto_mu must be > 0 when baseline_method=ditto")
+
+    if method == "fedta":
+        args.fedta_tail_ratio = float(getattr(args, "fedta_tail_ratio", 0.4))
+        args.fedta_anchor_lambda = float(getattr(args, "fedta_anchor_lambda", 0.5))
+        args.fedta_temperature = float(getattr(args, "fedta_temperature", 2.0))
+        args.fedta_min_tail_classes = int(getattr(args, "fedta_min_tail_classes", 1))
+        if args.fedta_anchor_lambda <= 0:
+            raise ValueError("fedta_anchor_lambda must be > 0 when baseline_method=fedta")
+        if args.fedta_temperature <= 0:
+            raise ValueError("fedta_temperature must be > 0 when baseline_method=fedta")
+        if args.fedta_min_tail_classes <= 0:
+            raise ValueError("fedta_min_tail_classes must be >= 1 when baseline_method=fedta")
+
+    if method == "af_fcl" and auto_cfg:
+        # AF-FCL（工程复现版）：遗忘感知回放 + 目标蒸馏
+        args.enable_replay = True
+        if str(getattr(args, "replay_mode", "none")).lower() == "none":
+            args.replay_mode = str(getattr(args, "baseline_affcl_replay_mode", "age_priority"))
+        if (
+            int(getattr(args, "replay_capacity", 0)) <= 0
+            and getattr(args, "replay_capacity_ratio", None) is None
+        ):
+            args.replay_capacity_ratio = float(getattr(args, "baseline_affcl_replay_capacity_ratio", 0.15))
+        if int(getattr(args, "replay_per_batch", 0)) <= 0:
+            args.replay_per_batch = int(getattr(args, "baseline_affcl_replay_per_batch", 32))
+        if float(getattr(args, "replay_old_task_scale", 1.0)) <= 1.0:
+            args.replay_old_task_scale = float(getattr(args, "baseline_affcl_old_task_scale", 1.2))
+        if float(getattr(args, "replay_old_task_scale_by_F", 0.0)) <= 0.0:
+            args.replay_old_task_scale_by_F = float(getattr(args, "baseline_affcl_old_task_scale_by_f", 2.0))
+
+        args.enable_kd = True
+        if str(getattr(args, "cl_kd_method", "none")).lower() == "none":
+            args.cl_kd_method = str(getattr(args, "baseline_affcl_kd_method", "logit"))
+        if float(getattr(args, "cl_kd_logit_lambda", 0.0)) <= 0:
+            args.cl_kd_logit_lambda = float(getattr(args, "baseline_affcl_kd_lambda", 0.5))
+        if float(getattr(args, "cl_kd_temperature", 0.0)) <= 0:
+            args.cl_kd_temperature = float(getattr(args, "baseline_affcl_kd_temperature", 2.0))
 
     return method
 
@@ -596,6 +636,27 @@ def run_baseline_retrain_pipeline(
         f"enable_replay={getattr(args, 'enable_replay', False)}, "
         f"enable_kd={getattr(args, 'enable_kd', False)}"
     )
+    if baseline_method == "fedta":
+        print(
+            "[Baseline] FedTA config: "
+            f"tail_ratio={getattr(args, 'fedta_tail_ratio', 0.4)}, "
+            f"anchor_lambda={getattr(args, 'fedta_anchor_lambda', 0.5)}, "
+            f"temperature={getattr(args, 'fedta_temperature', 2.0)}, "
+            f"min_tail_classes={getattr(args, 'fedta_min_tail_classes', 1)}"
+        )
+    elif baseline_method == "af_fcl":
+        print(
+            "[Baseline] AF-FCL config: "
+            f"replay_mode={getattr(args, 'replay_mode', 'none')}, "
+            f"replay_capacity={getattr(args, 'replay_capacity', 0)}, "
+            f"replay_capacity_ratio={getattr(args, 'replay_capacity_ratio', None)}, "
+            f"replay_per_batch={getattr(args, 'replay_per_batch', 0)}, "
+            f"replay_old_task_scale={getattr(args, 'replay_old_task_scale', 1.0)}, "
+            f"replay_old_task_scale_by_F={getattr(args, 'replay_old_task_scale_by_F', 0.0)}, "
+            f"kd_method={getattr(args, 'cl_kd_method', 'none')}, "
+            f"kd_lambda={getattr(args, 'cl_kd_logit_lambda', 0.0)}, "
+            f"kd_temperature={getattr(args, 'cl_kd_temperature', 1.0)}"
+        )
     args.search = False
     retrain_last_round = args.last_round if args.retrain_last_round is None else args.retrain_last_round
     retrain_run_config_kwargs = _build_retrain_run_config_kwargs(args, retrain_last_round)

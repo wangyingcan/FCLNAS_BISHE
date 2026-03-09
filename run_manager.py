@@ -499,6 +499,22 @@ class RunManager:
         # Ditto 等个性化方法可选的 proximal 正则上下文（按轮注入，默认关闭）
         self._prox_reference_state = None
         self._prox_mu = 0.0
+        # FedTA: Tail Anchor（baseline_method=fedta）
+        self.baseline_method = str(getattr(run_config, "baseline_method", "fedavg")).lower().replace("-", "_")
+        self.fedta_tail_ratio = float(getattr(run_config, "fedta_tail_ratio", 0.4))
+        self.fedta_anchor_lambda = float(getattr(run_config, "fedta_anchor_lambda", 0.0))
+        self.fedta_temperature = float(getattr(run_config, "fedta_temperature", 2.0))
+        self.fedta_min_tail_classes = max(1, int(getattr(run_config, "fedta_min_tail_classes", 1)))
+        self.enable_fedta = (
+            self.run_phase == "personalized_subnet_retrain"
+            and self.baseline_method == "fedta"
+            and self.fedta_anchor_lambda > 0
+        )
+        self._fedta_anchor_model = None
+        self.fedta_tail_classes = []
+        self._fedta_tail_class_tensor = None
+        if self.enable_fedta:
+            self._init_fedta_tail_classes()
         # 子网重训阶段可选：support/query 的 first-order 元学习更新
         self.retrain_meta_enable = bool(getattr(run_config, "retrain_meta_enable", False)) and (
             self.run_phase == "personalized_subnet_retrain"
@@ -1508,6 +1524,108 @@ class RunManager:
         kl_elem = (teacher_probs * (log_teacher - student_log_probs)) * mask
         return (kl_elem.sum() / mask.sum()) * (T * T)
 
+    def _init_fedta_tail_classes(self):
+        """按本地训练集标签频次选取尾部类别，用于 FedTA 的 Tail Anchor。"""
+        if not self.enable_fedta:
+            return
+        try:
+            provider = getattr(self.run_config, "data_provider", None) or self.run_config.data_provider
+            fcl_manager = getattr(provider, "fcl_manager", None)
+            if fcl_manager is None:
+                self.write_log(
+                    "[FedTA] no fcl_manager found, fallback to all classes for anchor distillation",
+                    prefix="train",
+                    should_print=True,
+                )
+                return
+            client_id = int(getattr(provider, "client_id", getattr(self.run_config, "client_id", -1)))
+            trn_idx, _, _ = fcl_manager.get(client_id=client_id, task_id=int(self.task_id))
+            if len(trn_idx) <= 0:
+                self.write_log(
+                    f"[FedTA] empty local train indices, task={self.task_id}, client={client_id}",
+                    prefix="train",
+                    should_print=True,
+                )
+                return
+            targets = np.asarray(getattr(fcl_manager, "train_targets"))
+            labels = targets[np.asarray(trn_idx, dtype=int)]
+            num_classes = int(getattr(provider, "n_classes", int(np.max(targets)) + 1))
+            counts = np.bincount(labels, minlength=num_classes)
+            present_classes = np.where(counts > 0)[0]
+            if present_classes.size <= 0:
+                return
+            ratio = float(min(max(self.fedta_tail_ratio, 0.0), 1.0))
+            tail_k = max(self.fedta_min_tail_classes, int(math.ceil(present_classes.size * ratio)))
+            tail_k = min(int(present_classes.size), int(tail_k))
+            sorted_classes = present_classes[np.argsort(counts[present_classes], kind="stable")]
+            tail_classes = sorted_classes[:tail_k]
+            self.fedta_tail_classes = [int(c) for c in tail_classes.tolist()]
+            self._fedta_tail_class_tensor = torch.tensor(
+                self.fedta_tail_classes,
+                device=self.device,
+                dtype=torch.long,
+            )
+            tail_counts = {int(c): int(counts[c]) for c in self.fedta_tail_classes}
+            self.write_log(
+                f"[FedTA] task={self.task_id} client={client_id} tail_ratio={ratio:.3f} "
+                f"tail_k={tail_k} tail_classes={self.fedta_tail_classes} tail_counts={tail_counts}",
+                prefix="train",
+                should_print=True,
+            )
+        except Exception as exc:
+            self.fedta_tail_classes = []
+            self._fedta_tail_class_tensor = None
+            self.write_log(
+                f"[FedTA] failed to build tail classes: {exc}",
+                prefix="train",
+                should_print=True,
+            )
+
+    def _refresh_fedta_anchor_model(self, server_model=None):
+        """用当前轮全局模型更新 FedTA anchor。"""
+        if not self.enable_fedta:
+            return
+        if self._fedta_anchor_model is None:
+            anchor = copy.deepcopy(self.net.module)
+            for p in anchor.parameters():
+                p.requires_grad = False
+            if torch.cuda.is_available():
+                anchor = torch.nn.DataParallel(anchor).to(self.device)
+            anchor.eval()
+            self._fedta_anchor_model = anchor
+
+        source_state = None
+        if server_model is not None:
+            if isinstance(server_model, nn.DataParallel):
+                source_state = server_model.module.state_dict()
+            else:
+                source_state = server_model.state_dict()
+        else:
+            source_state = self.net.module.state_dict()
+        self._fedta_anchor_model.module.load_state_dict(source_state, strict=False)
+        self._fedta_anchor_model.eval()
+
+    def _compute_fedta_loss(self, student_output, images, labels):
+        if not self.enable_fedta or self._fedta_anchor_model is None or self.fedta_anchor_lambda <= 0:
+            return None
+        with torch.no_grad():
+            teacher_out = self._fedta_anchor_model(images)
+            if not torch.isfinite(teacher_out).all():
+                teacher_out = torch.nan_to_num(teacher_out, nan=0.0, posinf=1e4, neginf=-1e4)
+        if self._fedta_tail_class_tensor is not None and self._fedta_tail_class_tensor.numel() > 0:
+            tail_mask = (labels.unsqueeze(1) == self._fedta_tail_class_tensor.unsqueeze(0)).any(dim=1)
+            if tail_mask.sum() <= 0:
+                return None
+            student_slice = student_output[tail_mask]
+            teacher_slice = teacher_out[tail_mask]
+        else:
+            student_slice = student_output
+            teacher_slice = teacher_out
+        T = self.fedta_temperature if self.fedta_temperature > 0 else 1.0
+        student_log_probs = F.log_softmax(student_slice / T, dim=1)
+        teacher_probs = F.softmax(teacher_slice / T, dim=1)
+        return F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (T * T)
+
     def _compose_total_loss(
         self,
         output,
@@ -1515,12 +1633,16 @@ class RunManager:
         images,
         include_kd=True,
         include_prox=True,
+        include_fedta=True,
     ):
         ce_loss, output = self._compute_ce_loss(output, labels)
         kd_loss = self._compute_kd_loss(output, images) if include_kd else None
+        fedta_loss = self._compute_fedta_loss(output, images, labels) if include_fedta else None
         total_loss = ce_loss
         if kd_loss is not None:
             total_loss = total_loss + self.cl_kd_logit_lambda * kd_loss
+        if fedta_loss is not None:
+            total_loss = total_loss + self.fedta_anchor_lambda * fedta_loss
         if include_prox and self._prox_mu > 0 and self._prox_reference_state:
             prox_penalty = torch.zeros(1, device=self.device)
             for name, p in self.net.module.named_parameters():
@@ -1950,6 +2072,8 @@ class RunManager:
                 self.net.module.load_state_dict(server_model.module.state_dict())
             else:
                 self.net.module.load_state_dict(server_model.state_dict())
+        if self.enable_fedta:
+            self._refresh_fedta_anchor_model(server_model=server_model)
 
         nBatch = len(self.run_config.train_loader)
         if getattr(self, "replay_only_training", False) and replay_is_enabled(self):

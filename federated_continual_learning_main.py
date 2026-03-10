@@ -474,6 +474,37 @@ def run_nas_search_for_task(
 
         for idx in client_indices:
             client = clients[idx]
+            best_snapshot_path = os.path.join(
+                current_task_path,
+                "checkpoint",
+                f"task_{task_id}_client_{idx}_best_supernet.pth.tar",
+            )
+            export_source = "final_round"
+            if os.path.isfile(best_snapshot_path):
+                try:
+                    best_ckpt = torch.load(best_snapshot_path, map_location="cpu")
+                    best_state = best_ckpt.get("state_dict", None) if isinstance(best_ckpt, dict) else None
+                    if isinstance(best_state, dict):
+                        load_ret = client.net.load_state_dict(best_state, strict=False)
+                        missing = list(getattr(load_ret, "missing_keys", []))
+                        unexpected = list(getattr(load_ret, "unexpected_keys", []))
+                        best_round = int(best_ckpt.get("round", -1))
+                        export_source = f"best_round_{best_round + 1}" if best_round >= 0 else "best_round"
+                        print(
+                            f"[BestSubnet] task{task_id} client{idx} load={best_snapshot_path} "
+                            f"round={best_round + 1 if best_round >= 0 else 'NA'} "
+                            f"missing={len(missing)} unexpected={len(unexpected)}"
+                        )
+                    else:
+                        print(
+                            f"[BestSubnet] task{task_id} client{idx} missing state_dict in {best_snapshot_path}, "
+                            "fallback to final-round supernet"
+                        )
+                except Exception as e:
+                    print(
+                        f"[BestSubnet] task{task_id} client{idx} failed to load {best_snapshot_path}: {e}; "
+                        "fallback to final-round supernet"
+                    )
             artifact_path = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}_subnet.pt")
             artifact_export_dir = os.path.join(client_artifact_dir, f"client_{idx}_task_{task_id}")
             normal_net = export_supernet_client_subnet(
@@ -492,6 +523,8 @@ def run_nas_search_for_task(
                 },
                 export_dir=artifact_export_dir,
             )
+            with open(os.path.join(artifact_export_dir, "export_source.txt"), "w", encoding="utf-8") as fout:
+                fout.write(export_source + "\n")
 
             if not should_update_prior_history:
                 continue

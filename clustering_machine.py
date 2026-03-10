@@ -41,6 +41,77 @@ class ClusteringMachine:
             self.writerTf = SummaryWriter(logdir=os.path.join(self.path, 'tensorboard'), 
                                           comment=f"fed_search_task_{task_id}")
         print('tensorboardX logdir', self.writerTf.logdir)
+        self.client_best_records = {
+            int(idx): {
+                "val_top1": float("-inf"),
+                "val_loss": float("inf"),
+                "round": -1,
+                "checkpoint_path": self._client_best_checkpoint_path(int(idx)),
+            }
+            for idx in (clients_idx_arr or [])
+        }
+
+    def _client_best_checkpoint_path(self, client_id: int):
+        return os.path.join(
+            self.path,
+            "checkpoint",
+            f"task_{self.task_id}_client_{int(client_id)}_best_supernet.pth.tar",
+        )
+
+    def _update_client_best_snapshot(
+        self,
+        client_id: int,
+        round_idx: int,
+        trn_loss: float,
+        trn_top1: float,
+        val_loss: float,
+        val_top1: float,
+        entropy: float,
+        lr: float,
+    ):
+        record = self.client_best_records.setdefault(
+            int(client_id),
+            {
+                "val_top1": float("-inf"),
+                "val_loss": float("inf"),
+                "round": -1,
+                "checkpoint_path": self._client_best_checkpoint_path(int(client_id)),
+            },
+        )
+        if float(val_top1) <= float(record.get("val_top1", float("-inf"))):
+            return
+        ckpt_path = record["checkpoint_path"]
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        state_dict_cpu = {
+            key: value.detach().cpu().clone()
+            for key, value in self.clients[client_id].net.state_dict().items()
+        }
+        payload = {
+            "task_id": int(self.task_id),
+            "client_id": int(client_id),
+            "round": int(round_idx),
+            "trn_loss": float(trn_loss),
+            "trn_top1": float(trn_top1),
+            "val_loss": float(val_loss),
+            "val_top1": float(val_top1),
+            "entropy": float(entropy),
+            "lr": float(lr),
+            "state_dict": state_dict_cpu,
+        }
+        torch.save(payload, ckpt_path)
+        record["val_top1"] = float(val_top1)
+        record["val_loss"] = float(val_loss)
+        record["round"] = int(round_idx)
+        self.write_log(
+            "search client{} new_best round{} val_top1 {:.4f} val_loss {:.4f} ckpt {}".format(
+                client_id,
+                round_idx + 1,
+                float(val_top1),
+                float(val_loss),
+                ckpt_path,
+            ),
+            prefix="search",
+        )
 
     def _append_per_client_metric(self, phase, round_idx, client_id, **metrics):
         record = {
@@ -209,6 +280,16 @@ class ClusteringMachine:
                     arch_prior_penalty=float(getattr(self.clients[idx], "arch_prior_penalty_last", 0.0)),
                     lr=lr,
                 )
+                self._update_client_best_snapshot(
+                    client_id=idx,
+                    round_idx=round,
+                    trn_loss=trn_loss,
+                    trn_top1=trn_top1,
+                    val_loss=val_loss,
+                    val_top1=val_top1,
+                    entropy=entropy,
+                    lr=lr,
+                )
                 clients_trn_loss.update(trn_loss)
                 clients_trn_top1.update(trn_top1)
                 clients_trn_top5.update(trn_top5)
@@ -330,6 +411,17 @@ class ClusteringMachine:
             "search_completed",
             checkpoint_path=os.path.join(self.global_server.run_manager.save_path, "global.pth.tar"),
         )
+        best_summary_path = os.path.join(
+            self.logs_path,
+            f"task_{self.task_id}_client_best_summary.json",
+        )
+        with open(best_summary_path, "w", encoding="utf-8") as fout:
+            json.dump(
+                {str(k): v for k, v in self.client_best_records.items()},
+                fout,
+                indent=2,
+                ensure_ascii=True,
+            )
         self.writerTf.close()
 
     

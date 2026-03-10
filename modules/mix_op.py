@@ -292,15 +292,29 @@ class MixedEdge(MyModule):
             assert self.active_op.is_zero_layer()
             return
         involved_idx = [idx for idx, _ in (self.active_index + self.inactive_index)]
-        old_alphas = [alpha for _, alpha in (self.active_index + self.inactive_index)]
-        new_alphas = [self.AP_path_alpha.data[idx] for idx in involved_idx]
-
-        offset = math.log(
-            sum([math.exp(alpha) for alpha in new_alphas]) / sum([math.exp(alpha) for alpha in old_alphas])
+        old_alphas = torch.tensor(
+            [alpha for _, alpha in (self.active_index + self.inactive_index)],
+            device=self.AP_path_alpha.device,
+            dtype=self.AP_path_alpha.dtype,
         )
 
+        # 使用 logsumexp 避免 exp 溢出；并对异常 alpha 做截断，防止数值发散。
+        new_alpha_list = []
         for idx in involved_idx:
-            self.AP_path_alpha.data[idx] -= offset
+            val = self.AP_path_alpha.data[idx]
+            if not torch.isfinite(val):
+                val = torch.zeros_like(val)
+            val = val.clamp(min=-50.0, max=50.0)
+            self.AP_path_alpha.data[idx] = val
+            new_alpha_list.append(val)
+        new_alphas = torch.stack(new_alpha_list, dim=0)
+        old_alphas = torch.nan_to_num(old_alphas, nan=0.0, posinf=50.0, neginf=-50.0).clamp_(-50.0, 50.0)
+
+        offset_t = torch.logsumexp(new_alphas, dim=0) - torch.logsumexp(old_alphas, dim=0)
+        offset = float(offset_t.item()) if torch.isfinite(offset_t) else 0.0
+
+        for idx in involved_idx:
+            self.AP_path_alpha.data[idx].sub_(offset).clamp_(-50.0, 50.0)
 
 
 class ArchGradientFunction(torch.autograd.Function):

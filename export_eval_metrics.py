@@ -17,6 +17,8 @@ TIMING_RE = re.compile(
     r"evaluation\s+([0-9.]+)m,\s+checkpoint_io\s+([0-9.]+)m,\s+algorithm\s+([0-9.]+)m,\s+wall\s+([0-9.]+)m"
 )
 FORGETTING_RE = re.compile(r"forgetting_F_max:\s*([-+]?[0-9]*\.?[0-9]+)")
+PER_TASK_TOP1_RE = re.compile(r"per_task_test_top1:\s*(.+)")
+TASK_ACC_ITEM_RE = re.compile(r"T(\d+)\s*:\s*([-+]?[0-9]*\.?[0-9]+)")
 
 
 def safe_float(x) -> Optional[float]:
@@ -62,6 +64,51 @@ def discover_task_dirs(exp_prefix: str) -> List[Tuple[int, str]]:
             task_dirs.append((int(m.group("task")), exp_prefix))
     task_dirs.sort(key=lambda x: x[0])
     return task_dirs
+
+
+def parse_client_id_from_dirname(name: str) -> Optional[int]:
+    if not name.startswith("client_"):
+        return None
+    try:
+        return int(name.split("_", 1)[1])
+    except Exception:
+        return None
+
+
+def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dict[int, float]:
+    """
+    从每个客户端目录的 logs/test_console.txt 中提取当前任务 top1。
+    规则：取最后一条 per_task_test_top1 记录里的 T{task_id}。
+    """
+    out: Dict[int, float] = {}
+    clients_root = os.path.join(task_dir, "clients")
+    if not os.path.isdir(clients_root):
+        return out
+
+    for name in sorted(os.listdir(clients_root)):
+        cid = parse_client_id_from_dirname(name)
+        if cid is None:
+            continue
+        log_path = os.path.join(clients_root, name, "logs", "test_console.txt")
+        if not os.path.isfile(log_path):
+            continue
+
+        last_val = None
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = PER_TASK_TOP1_RE.search(line)
+                if m is None:
+                    continue
+                payload = m.group(1)
+                # 支持形如：T1:27.3, T2:31.1, ...
+                for t_str, v_str in TASK_ACC_ITEM_RE.findall(payload):
+                    if int(t_str) == int(task_id):
+                        val = safe_float(v_str)
+                        if val is not None:
+                            last_val = val
+        if last_val is not None:
+            out[cid] = float(last_val)
+    return out
 
 
 def pick_last_retrain_test_summary(stats_records: List[dict]) -> Optional[dict]:
@@ -172,8 +219,21 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
         summary = pick_last_retrain_test_summary(stats_records)
 
         per_client_records = load_jsonl(metric_path)
+        # 以客户端日志 logs/test_console.txt 的当前任务精度为主
+        from_client_logs = parse_current_task_top1_from_client_logs(task_dir, task_id)
         final_round, cur_map, test_map = extract_final_per_client_current_task(per_client_records)
-        used_map = cur_map if cur_map else (test_map if use_test_top1_fallback else {})
+        if from_client_logs:
+            used_map = from_client_logs
+            source = "clients/test_console.txt"
+        elif cur_map:
+            used_map = cur_map
+            source = "per_client_metrics.current_task_top1"
+        elif use_test_top1_fallback and test_map:
+            used_map = test_map
+            source = "per_client_metrics.test_top1_fallback"
+        else:
+            used_map = {}
+            source = "missing"
         for cid, score in used_map.items():
             client_task_scores[(cid, task_id)] = float(score)
 
@@ -183,9 +243,7 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
             "task_dir": task_dir,
             "final_round_from_per_client": final_round,
             "available_clients_in_task": len(used_map),
-            "current_task_source": "current_task_top1"
-            if cur_map
-            else ("test_top1_fallback" if use_test_top1_fallback and test_map else "missing"),
+            "current_task_source": source,
             "current_task_top1_mean": None,
             "current_task_top1_weighted_mean": None,
             "current_task_top1_std": None,
@@ -216,6 +274,14 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
                 "test_top5_mean",
             ]:
                 task_row[key] = safe_float(summary.get(key))
+        # 用客户端日志重算当前任务统计（优先于 summary）
+        if used_map:
+            vals = [float(v) for v in used_map.values()]
+            task_row["current_task_top1_mean"] = float(mean(vals))
+            task_row["current_task_top1_weighted_mean"] = float(mean(vals))
+            task_row["current_task_top1_std"] = float(pstdev(vals)) if len(vals) > 1 else 0.0
+            task_row["current_task_top1_min"] = float(min(vals))
+            task_row["current_task_top1_max"] = float(max(vals))
         forgetting_val = parse_last_forgetting_fmax(test_log_path)
         task_row["final_forgetting_fmax"] = forgetting_val
         if forgetting_val is not None:

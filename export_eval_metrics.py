@@ -19,6 +19,7 @@ TIMING_RE = re.compile(
 FORGETTING_RE = re.compile(r"forgetting_F_max:\s*([-+]?[0-9]*\.?[0-9]+)")
 PER_TASK_TOP1_RE = re.compile(r"per_task_test_top1:\s*(.+)")
 TASK_ACC_ITEM_RE = re.compile(r"T(\d+)\s*:\s*([-+]?[0-9]*\.?[0-9]+)")
+SIZE_WITH_UNIT_RE = re.compile(r"^\s*([-+]?[0-9]*\.?[0-9]+)\s*([KMBkmb]?)\s*$")
 
 
 def safe_float(x) -> Optional[float]:
@@ -31,6 +32,35 @@ def safe_float(x) -> Optional[float]:
     except Exception:
         return None
     return None
+
+
+def parse_metric_to_million(x) -> Optional[float]:
+    """
+    将参数量/FLOPs统一转换为“百万(M)”为单位的 float。
+    支持:
+    - "2.34M" / "850K" / "1.2B"
+    - 纯数字（>1e5 视作原始计数并除以 1e6）
+    """
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        v = float(x)
+        if not math.isfinite(v):
+            return None
+        return v / 1e6 if abs(v) > 1e5 else v
+    s = str(x).strip()
+    m = SIZE_WITH_UNIT_RE.match(s)
+    if m is None:
+        return None
+    v = safe_float(m.group(1))
+    if v is None:
+        return None
+    unit = m.group(2).upper()
+    if unit == "B":
+        return v * 1e3
+    if unit == "K":
+        return v * 1e-3
+    return v
 
 
 def load_jsonl(path: str) -> List[dict]:
@@ -146,6 +176,79 @@ def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dic
                 break
         if best_val is not None:
             out[cid] = float(best_val)
+    return out
+
+
+def parse_net_info_file(net_info_path: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    读取 net_info.txt 并返回 (param_m, flops_m)，单位均为 M。
+    """
+    if not os.path.isfile(net_info_path):
+        return None, None
+    try:
+        with open(net_info_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read().strip()
+    except Exception:
+        return None, None
+
+    if not text:
+        return None, None
+
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        return parse_metric_to_million(data.get("param")), parse_metric_to_million(data.get("flops"))
+
+    # 兼容非严格 JSON 文本
+    param_m = None
+    flops_m = None
+    pm = re.search(r'"param"\s*:\s*"([^"]+)"', text)
+    fm = re.search(r'"flops"\s*:\s*"([^"]+)"', text)
+    if pm is not None:
+        param_m = parse_metric_to_million(pm.group(1))
+    if fm is not None:
+        flops_m = parse_metric_to_million(fm.group(1))
+    return param_m, flops_m
+
+
+def parse_client_model_complexity_from_net_info(task_dir: str) -> Dict[int, Dict[str, Optional[float]]]:
+    """
+    从任务目录中收集每个 client 的 net_info 参数量/FLOPs（单位 M）。
+    """
+    out: Dict[int, Dict[str, Optional[float]]] = {}
+    candidate_files: Dict[int, List[str]] = defaultdict(list)
+
+    def _collect_from_clients_root(clients_root: str):
+        if not os.path.isdir(clients_root):
+            return
+        for name in sorted(os.listdir(clients_root)):
+            cid = parse_client_id_from_dirname(name)
+            if cid is None:
+                continue
+            candidate_files[cid].append(os.path.join(clients_root, name, "net_info.txt"))
+            candidate_files[cid].append(os.path.join(clients_root, name, "logs", "net_info.txt"))
+
+    _collect_from_clients_root(os.path.join(task_dir, "clients"))
+    _collect_from_clients_root(os.path.join(task_dir, "learned_net", "clients"))
+
+    for cid, paths in candidate_files.items():
+        valid_paths = [p for p in paths if os.path.isfile(p)]
+        if not valid_paths:
+            continue
+        valid_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        best_param_m = None
+        best_flops_m = None
+        for p in valid_paths:
+            pm, fm = parse_net_info_file(p)
+            if pm is not None or fm is not None:
+                best_param_m, best_flops_m = pm, fm
+                break
+        if best_param_m is not None or best_flops_m is not None:
+            out[cid] = {"param_m": best_param_m, "flops_m": best_flops_m}
     return out
 
 
@@ -275,6 +378,18 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
         for cid, score in used_map.items():
             client_task_scores[(cid, task_id)] = float(score)
 
+        client_complexity_map = parse_client_model_complexity_from_net_info(task_dir)
+        param_vals = [
+            float(v["param_m"])
+            for v in client_complexity_map.values()
+            if v.get("param_m") is not None
+        ]
+        flops_vals = [
+            float(v["flops_m"])
+            for v in client_complexity_map.values()
+            if v.get("flops_m") is not None
+        ]
+
         task_row = {
             "exp_prefix": exp_prefix,
             "task_id": task_id,
@@ -295,6 +410,10 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
             "test_loss_mean": None,
             "test_top5_mean": None,
             "final_forgetting_fmax": None,
+            "avg_param_m": None,
+            "avg_flops_m": None,
+            "param_client_count": 0,
+            "flops_client_count": 0,
         }
         if summary is not None:
             for key in [
@@ -324,6 +443,12 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
         task_row["final_forgetting_fmax"] = forgetting_val
         if forgetting_val is not None:
             final_forgetting_fmax = forgetting_val
+        if param_vals:
+            task_row["avg_param_m"] = float(mean(param_vals))
+            task_row["param_client_count"] = int(len(param_vals))
+        if flops_vals:
+            task_row["avg_flops_m"] = float(mean(flops_vals))
+            task_row["flops_client_count"] = int(len(flops_vals))
         task_rows.append(task_row)
 
         search_timing = parse_timing_log(os.path.join(logs_dir, "search.log"))
@@ -368,6 +493,9 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
         if r["current_task_top1_mean"] is not None
     ]
     task_avgacc_mean = mean(task_mean_vals) if task_mean_vals else None
+    task_param_vals = [r["avg_param_m"] for r in task_rows if r["avg_param_m"] is not None]
+    task_flops_vals = [r["avg_flops_m"] for r in task_rows if r["avg_flops_m"] is not None]
+    final_task_row = task_rows[-1] if task_rows else {}
 
     summary_row = {
         "exp_prefix": exp_prefix,
@@ -379,6 +507,10 @@ def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) 
         "Client_Std": client_std,
         "CurrentTask_AvgAcc_Mean": task_avgacc_mean,
         "Final_Forgetting_Fmax": final_forgetting_fmax,
+        "FinalTask_Avg_Param_M": final_task_row.get("avg_param_m"),
+        "FinalTask_Avg_FLOPs_M": final_task_row.get("avg_flops_m"),
+        "Avg_Param_MeanAcrossTasks": mean(task_param_vals) if task_param_vals else None,
+        "Avg_FLOPs_MeanAcrossTasks": mean(task_flops_vals) if task_flops_vals else None,
         "Search_algorithm_min_total": search_cost["algorithm_min"],
         "Search_wall_min_total": search_cost["wall_min"],
         "Retrain_algorithm_min_total": retrain_cost["algorithm_min"],
@@ -469,6 +601,10 @@ def main():
             "Client_Std",
             "CurrentTask_AvgAcc_Mean",
             "Final_Forgetting_Fmax",
+            "FinalTask_Avg_Param_M",
+            "FinalTask_Avg_FLOPs_M",
+            "Avg_Param_MeanAcrossTasks",
+            "Avg_FLOPs_MeanAcrossTasks",
             "Search_algorithm_min_total",
             "Search_wall_min_total",
             "Retrain_algorithm_min_total",

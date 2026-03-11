@@ -75,39 +75,67 @@ def parse_client_id_from_dirname(name: str) -> Optional[int]:
         return None
 
 
+def parse_current_task_top1_from_log_file(log_path: str, task_id: int) -> Optional[float]:
+    if not os.path.isfile(log_path):
+        return None
+    last_val = None
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = PER_TASK_TOP1_RE.search(line)
+            if m is None:
+                continue
+            payload = m.group(1)
+            for t_str, v_str in TASK_ACC_ITEM_RE.findall(payload):
+                if int(t_str) == int(task_id):
+                    val = safe_float(v_str)
+                    if val is not None:
+                        last_val = val
+    return last_val
+
+
 def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dict[int, float]:
     """
     从每个客户端目录的 logs/test_console.txt 中提取当前任务 top1。
     规则：取最后一条 per_task_test_top1 记录里的 T{task_id}。
     """
     out: Dict[int, float] = {}
+    candidate_files: Dict[int, List[str]] = defaultdict(list)
+
+    # A) retrain_pipeline 常见结构：task_dir/clients/client_x/logs/test_console.txt
     clients_root = os.path.join(task_dir, "clients")
-    if not os.path.isdir(clients_root):
-        return out
+    if os.path.isdir(clients_root):
+        for name in sorted(os.listdir(clients_root)):
+            cid = parse_client_id_from_dirname(name)
+            if cid is None:
+                continue
+            candidate_files[cid].append(
+                os.path.join(clients_root, name, "logs", "test_console.txt")
+            )
 
-    for name in sorted(os.listdir(clients_root)):
-        cid = parse_client_id_from_dirname(name)
-        if cid is None:
-            continue
-        log_path = os.path.join(clients_root, name, "logs", "test_console.txt")
-        if not os.path.isfile(log_path):
-            continue
+    # B) 搜索阶段常见结构：task_dir/logs/client_x_test_console.txt
+    logs_root = os.path.join(task_dir, "logs")
+    if os.path.isdir(logs_root):
+        for p in glob.glob(os.path.join(logs_root, "client_*_test_console.txt")):
+            base = os.path.basename(p)
+            m = re.match(r"client_(\d+)_test_console\.txt$", base)
+            if m is None:
+                continue
+            cid = int(m.group(1))
+            candidate_files[cid].append(p)
 
-        last_val = None
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = PER_TASK_TOP1_RE.search(line)
-                if m is None:
-                    continue
-                payload = m.group(1)
-                # 支持形如：T1:27.3, T2:31.1, ...
-                for t_str, v_str in TASK_ACC_ITEM_RE.findall(payload):
-                    if int(t_str) == int(task_id):
-                        val = safe_float(v_str)
-                        if val is not None:
-                            last_val = val
-        if last_val is not None:
-            out[cid] = float(last_val)
+    # 同一 client 可能有多个候选日志，取修改时间最新的文件
+    for cid, paths in candidate_files.items():
+        valid_paths = [p for p in paths if os.path.isfile(p)]
+        if not valid_paths:
+            continue
+        valid_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        best_val = None
+        for p in valid_paths:
+            best_val = parse_current_task_top1_from_log_file(p, task_id)
+            if best_val is not None:
+                break
+        if best_val is not None:
+            out[cid] = float(best_val)
     return out
 
 

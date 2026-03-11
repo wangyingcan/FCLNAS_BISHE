@@ -149,7 +149,7 @@ def parse_last_forgetting_fmax(path: str) -> Optional[float]:
     return last_val
 
 
-def summarize_experiment(exp_prefix: str) -> Tuple[dict, List[dict], List[dict]]:
+def summarize_experiment(exp_prefix: str, use_test_top1_fallback: bool = False) -> Tuple[dict, List[dict], List[dict]]:
     task_dirs = discover_task_dirs(exp_prefix)
     if not task_dirs:
         raise FileNotFoundError(f"未找到任务目录: {exp_prefix}-task*")
@@ -173,7 +173,7 @@ def summarize_experiment(exp_prefix: str) -> Tuple[dict, List[dict], List[dict]]
 
         per_client_records = load_jsonl(metric_path)
         final_round, cur_map, test_map = extract_final_per_client_current_task(per_client_records)
-        used_map = cur_map if cur_map else test_map
+        used_map = cur_map if cur_map else (test_map if use_test_top1_fallback else {})
         for cid, score in used_map.items():
             client_task_scores[(cid, task_id)] = float(score)
 
@@ -183,6 +183,9 @@ def summarize_experiment(exp_prefix: str) -> Tuple[dict, List[dict], List[dict]]
             "task_dir": task_dir,
             "final_round_from_per_client": final_round,
             "available_clients_in_task": len(used_map),
+            "current_task_source": "current_task_top1"
+            if cur_map
+            else ("test_top1_fallback" if use_test_top1_fallback and test_map else "missing"),
             "current_task_top1_mean": None,
             "current_task_top1_weighted_mean": None,
             "current_task_top1_std": None,
@@ -254,11 +257,11 @@ def summarize_experiment(exp_prefix: str) -> Tuple[dict, List[dict], List[dict]]
         best_client = None
         client_std = None
 
-    # Task-level mean of current-task accuracy
+    # Task-level mean of current-task accuracy（仅当前任务精度）
     task_mean_vals = [
-        r["current_task_top1_mean"] if r["current_task_top1_mean"] is not None else r["test_top1_mean"]
+        r["current_task_top1_mean"]
         for r in task_rows
-        if (r["current_task_top1_mean"] is not None or r["test_top1_mean"] is not None)
+        if r["current_task_top1_mean"] is not None
     ]
     task_avgacc_mean = mean(task_mean_vals) if task_mean_vals else None
 
@@ -270,7 +273,7 @@ def summarize_experiment(exp_prefix: str) -> Tuple[dict, List[dict], List[dict]]
         "Worst_client_Acc": worst_client,
         "Best_client_Acc": best_client,
         "Client_Std": client_std,
-        "Task_AvgAcc_Mean": task_avgacc_mean,
+        "CurrentTask_AvgAcc_Mean": task_avgacc_mean,
         "Final_Forgetting_Fmax": final_forgetting_fmax,
         "Search_algorithm_min_total": search_cost["algorithm_min"],
         "Search_wall_min_total": search_cost["wall_min"],
@@ -325,6 +328,11 @@ def main():
         default="fcl_metrics",
         help="导出文件名前缀",
     )
+    parser.add_argument(
+        "--use_test_top1_fallback",
+        action="store_true",
+        help="仅当历史日志缺少 current_task_top1 时，回退使用 test_top1（默认关闭）",
+    )
     args = parser.parse_args()
 
     summary_rows: List[dict] = []
@@ -332,7 +340,10 @@ def main():
     client_rows_all: List[dict] = []
 
     for exp_prefix in args.exp_prefixes:
-        summary_row, task_rows, client_rows = summarize_experiment(exp_prefix)
+        summary_row, task_rows, client_rows = summarize_experiment(
+            exp_prefix,
+            use_test_top1_fallback=bool(args.use_test_top1_fallback),
+        )
         summary_rows.append(summary_row)
         task_rows_all.extend(task_rows)
         client_rows_all.extend(client_rows)
@@ -352,7 +363,7 @@ def main():
             "Worst_client_Acc",
             "Best_client_Acc",
             "Client_Std",
-            "Task_AvgAcc_Mean",
+            "CurrentTask_AvgAcc_Mean",
             "Final_Forgetting_Fmax",
             "Search_algorithm_min_total",
             "Search_wall_min_total",

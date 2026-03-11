@@ -101,9 +101,9 @@ def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dic
     out: Dict[int, float] = {}
     candidate_files: Dict[int, List[str]] = defaultdict(list)
 
-    # A) retrain_pipeline 常见结构：task_dir/clients/client_x/logs/test_console.txt
-    clients_root = os.path.join(task_dir, "clients")
-    if os.path.isdir(clients_root):
+    def _collect_from_clients_root(clients_root: str):
+        if not os.path.isdir(clients_root):
+            return
         for name in sorted(os.listdir(clients_root)):
             cid = parse_client_id_from_dirname(name)
             if cid is None:
@@ -112,9 +112,9 @@ def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dic
                 os.path.join(clients_root, name, "logs", "test_console.txt")
             )
 
-    # B) 搜索阶段常见结构：task_dir/logs/client_x_test_console.txt
-    logs_root = os.path.join(task_dir, "logs")
-    if os.path.isdir(logs_root):
+    def _collect_from_logs_root(logs_root: str):
+        if not os.path.isdir(logs_root):
+            return
         for p in glob.glob(os.path.join(logs_root, "client_*_test_console.txt")):
             base = os.path.basename(p)
             m = re.match(r"client_(\d+)_test_console\.txt$", base)
@@ -122,6 +122,16 @@ def parse_current_task_top1_from_client_logs(task_dir: str, task_id: int) -> Dic
                 continue
             cid = int(m.group(1))
             candidate_files[cid].append(p)
+
+    # A) retrain_pipeline 常见结构：task_dir/clients/client_x/logs/test_console.txt
+    # B) learned_net 结构：task_dir/learned_net/clients/client_x/logs/test_console.txt
+    _collect_from_clients_root(os.path.join(task_dir, "clients"))
+    _collect_from_clients_root(os.path.join(task_dir, "learned_net", "clients"))
+
+    # C) 搜索阶段常见结构：task_dir/logs/client_x_test_console.txt
+    # D) learned_net 日志结构：task_dir/learned_net/logs/client_x_test_console.txt
+    _collect_from_logs_root(os.path.join(task_dir, "logs"))
+    _collect_from_logs_root(os.path.join(task_dir, "learned_net", "logs"))
 
     # 同一 client 可能有多个候选日志，取修改时间最新的文件
     for cid, paths in candidate_files.items():

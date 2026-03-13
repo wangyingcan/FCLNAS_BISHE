@@ -121,10 +121,13 @@ class GradientArchSearchConfig(ArchSearchConfig):
 
     def get_update_schedule(self, nBatch):
         schedule = {}
-        if nBatch < self.update_arch_param_every:
-            self.update_arch_param_every = nBatch
+        if nBatch <= 0:
+            return schedule
+        update_every = max(1, int(self.update_arch_param_every))
+        if nBatch < update_every:
+            update_every = nBatch
         for i in range(nBatch):
-            if (i + 1) % self.update_arch_param_every == 0:
+            if (i + 1) % update_every == 0:
                 schedule[i] = self.update_steps
         return schedule
 
@@ -189,6 +192,8 @@ class RLArchSearchConfig(ArchSearchConfig):
 
     def get_update_schedule(self, nBatch):
         schedule = {}
+        if nBatch <= 0:
+            return schedule
         if self.update_per_epoch:
             schedule[nBatch - 1] = self.update_steps_per_epoch
         else:
@@ -654,6 +659,12 @@ class ArchSearchRunManager:
         nBatch = len(data_loader)
         if fix_net_weights:
             data_loader = [(0, 0)] * nBatch
+        if nBatch == 0:
+            client_id = getattr(self.run_manager.run_config.data_provider, "client_id", "unknown")
+            self.write_log(
+                f"[SearchSkip] task{self.task_id} client{client_id} train loader empty, skip local weight/arch updates",
+                prefix="search",
+            )
 
         arch_param_num = len(list(self.net.architecture_parameters()))
         self.entropy = AverageMeter()
@@ -665,15 +676,12 @@ class ArchSearchRunManager:
                 prefix="search",
                 should_logging_info=False,
             )
-        trn_loss, trn_top1, trn_top5, val_loss, val_top1, val_top5, arch_entropy = (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        trn_loss, trn_top1, trn_top5, arch_entropy = 0.0, 0.0, 0.0, 0.0
+        val_loss, val_top1, val_top5 = None, None, None
+        if self.run_manager.optimizer.param_groups:
+            lr = float(self.run_manager.optimizer.param_groups[0].get("lr", 0.0))
+        else:
+            lr = 0.0
         use_meta_grad = isinstance(self.arch_search_config, GradientArchSearchConfig) and bool(
             getattr(self.arch_search_config, "meta_enable", False)
         )

@@ -164,17 +164,58 @@ def load_task1_bootstrap(super_net, bootstrap_ckpt_path: str, load_arch_params: 
     try:
         checkpoint = torch.load(ckpt_path, map_location=torch.device("cpu"))
         state_dict = checkpoint.get("state_dict", checkpoint)
-        if not bool(load_arch_params):
-            state_dict = {
-                key: value
-                for key, value in state_dict.items()
-                if "AP_path_alpha" not in key and "AP_path_wb" not in key
-            }
+        if not isinstance(state_dict, dict):
+            print(f"[FCL] Invalid bootstrap state dict format: {type(state_dict)}")
+            return False
+
         model_dict = super_net.state_dict()
-        model_dict.update(state_dict)
+        filtered = {}
+        dropped_arch = 0
+        dropped_not_found = 0
+        dropped_shape = 0
+        dropped_classifier = 0
+
+        for key, value in state_dict.items():
+            mapped_key = key
+            if mapped_key not in model_dict and mapped_key.startswith("module."):
+                alt_key = mapped_key[len("module."):]
+                if alt_key in model_dict:
+                    mapped_key = alt_key
+
+            if not bool(load_arch_params) and ("AP_path_alpha" in mapped_key or "AP_path_wb" in mapped_key):
+                dropped_arch += 1
+                continue
+
+            if mapped_key not in model_dict:
+                dropped_not_found += 1
+                continue
+
+            target_tensor = model_dict[mapped_key]
+            if hasattr(value, "shape") and hasattr(target_tensor, "shape"):
+                if tuple(value.shape) != tuple(target_tensor.shape):
+                    dropped_shape += 1
+                    if "classifier" in mapped_key:
+                        dropped_classifier += 1
+                    continue
+
+            filtered[mapped_key] = value
+
+        if not filtered:
+            print(
+                f"[FCL] Bootstrap has no compatible keys for current model: {ckpt_path} "
+                f"(drop_arch={dropped_arch}, drop_not_found={dropped_not_found}, "
+                f"drop_shape={dropped_shape}, drop_classifier={dropped_classifier})"
+            )
+            return False
+
+        model_dict.update(filtered)
         super_net.load_state_dict(model_dict)
         mode_desc = "weights+arch" if bool(load_arch_params) else "weights-only"
-        print(f"[FCL] Loaded task1 bootstrap supernet from {ckpt_path} ({mode_desc})")
+        print(
+            f"[FCL] Loaded task1 bootstrap supernet from {ckpt_path} ({mode_desc}), "
+            f"loaded={len(filtered)}, drop_arch={dropped_arch}, drop_not_found={dropped_not_found}, "
+            f"drop_shape={dropped_shape}, drop_classifier={dropped_classifier}"
+        )
         return True
     except Exception as e:
         print(f"[FCL] Failed to load task1 bootstrap supernet from {ckpt_path}: {e}")

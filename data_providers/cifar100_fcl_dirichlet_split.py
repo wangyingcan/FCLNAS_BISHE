@@ -30,6 +30,7 @@ class FCLDataManager(object):
                  num_tasks: int = 10,
                  classes_per_task: int = None,
                  alpha: float = 0.3,
+                 min_samples_per_class_per_client: int = 0,
                  val_ratio: float = 0.1,
                  seed: int = 0,
                  precompute: bool = True,
@@ -46,6 +47,9 @@ class FCLDataManager(object):
         self.T = int(num_tasks)
         self.CPT = int(classes_per_task)
         self.alpha = float(alpha)
+        self.min_samples_per_class_per_client = int(min_samples_per_class_per_client)
+        if self.min_samples_per_class_per_client < 0:
+            raise ValueError("min_samples_per_class_per_client 必须 >= 0")
         self.val_ratio = float(val_ratio)
         self.seed = int(seed)
         self.iid = bool(iid)
@@ -151,14 +155,18 @@ class FCLDataManager(object):
                 counts = np.full(self.K, base, dtype=int)
                 counts[:rem] += 1
             else:
-                # 非IID：按 Dirichlet(α) 采样比例
-                p = rng.dirichlet(alpha=np.full(self.K, self.alpha))
-                counts = (p * n).astype(int)
-                # 修正四舍五入导致的和不等于 n 的情况
-                while counts.sum() < n:
-                    counts[np.argmax(p)] += 1
-                while counts.sum() > n:
-                    counts[np.argmin(p)] -= 1
+                # 非IID：先做每类每客户端保底，再对余量做 Dirichlet(α)
+                min_req = min(self.min_samples_per_class_per_client, n // self.K)
+                counts = np.full(self.K, min_req, dtype=int)
+                residual = n - int(counts.sum())
+                if residual > 0:
+                    p = rng.dirichlet(alpha=np.full(self.K, self.alpha))
+                    delta = (p * residual).astype(int)
+                    while delta.sum() < residual:
+                        delta[np.argmax(p)] += 1
+                    while delta.sum() > residual:
+                        delta[np.argmin(p)] -= 1
+                    counts += delta
             # 切片分配（不重叠）
             st = 0
             for k in range(self.K):
@@ -232,6 +240,7 @@ class FCLDataManager(object):
             "num_tasks": self.T,
             "classes_per_task": self.CPT,
             "alpha": self.alpha,
+            "min_samples_per_class_per_client": self.min_samples_per_class_per_client,
             "val_ratio": self.val_ratio,
             "seed": self.seed,
         }
@@ -243,7 +252,9 @@ class FCLDataManager(object):
         包含：每个 task 的 classes、每个 client 的 train/val 索引与样本数、每个 client 的训练类集合、以及全局配置信息。
         """
         out = {"config": {"num_clients": self.K, "num_tasks": self.T, "classes_per_task": self.CPT,
-                          "alpha": self.alpha, "val_ratio": self.val_ratio, "seed": self.seed},
+                          "alpha": self.alpha,
+                          "min_samples_per_class_per_client": self.min_samples_per_class_per_client,
+                          "val_ratio": self.val_ratio, "seed": self.seed},
                "tasks": {}}
         for t in range(1, self.T + 1):
             task_entry = {}
@@ -284,7 +295,8 @@ class DataLoaderX(DataLoader):
 class CifarDataProvider100(DataProvider):
     def __init__(self, client_id=10, dataset_location=None, train_batch_size=1024,
                  test_batch_size=256, n_worker=2,
-                 num_clients=10, num_tasks=10, classes_per_task=10, alpha=0.3, val_ratio=0.1, seed=0,
+                 num_clients=10, num_tasks=10, classes_per_task=10, alpha=0.3,
+                 min_samples_per_class_per_client=0, val_ratio=0.1, seed=0,
                  search=True, task_id=1, is_client=True, iid=False):
         self.client_id = client_id
         self.task_id = task_id
@@ -319,6 +331,7 @@ class CifarDataProvider100(DataProvider):
             num_tasks=num_tasks,
             classes_per_task=classes_per_task,
             alpha=alpha,
+            min_samples_per_class_per_client=min_samples_per_class_per_client,
             val_ratio=val_ratio,
             seed=seed,
             precompute=precompute,
@@ -411,10 +424,11 @@ class CifarDataProvider100(DataProvider):
         return 32
 
     def train(self):
+        can_shuffle = len(self.trn_set) > 0
         return DataLoaderX(
             self.trn_set,
             batch_size=self.train_batch_size,
-            shuffle=True,
+            shuffle=can_shuffle,
             num_workers=self.n_worker,
             pin_memory=True,
             drop_last=False,
@@ -424,9 +438,10 @@ class CifarDataProvider100(DataProvider):
         # valid调用时对于search阶段使用验证集
         if(self.search):
             print("搜索阶段使用验证集进行精度评估")
+            can_shuffle = len(self.val_set) > 0
             return DataLoaderX(self.val_set,
                            batch_size=self.test_batch_size,
-                           shuffle=True,
+                           shuffle=can_shuffle,
                            num_workers=self.n_worker,
                            pin_memory=True,
                            drop_last=False,
@@ -434,9 +449,10 @@ class CifarDataProvider100(DataProvider):
         # valid调用时对于retrain阶段使用测试集
         else:
             print("重训阶段使用测试集进行精度评估")
+            can_shuffle = len(self.test_dataset) > 0
             return DataLoaderX(self.test_dataset,
                            batch_size=self.test_batch_size,
-                           shuffle=True,
+                           shuffle=can_shuffle,
                            num_workers=self.n_worker,
                            pin_memory=True,
                            drop_last=False,

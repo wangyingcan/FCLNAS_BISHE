@@ -31,6 +31,7 @@ class FCLDataManagerC10(object):
                  num_tasks: int = 10,
                  classes_per_task: int = None,
                  alpha: float = 0.3,
+                 min_samples_per_class_per_client: int = 0,
                  val_ratio: float = 0.1,
                  seed: int = 0,
                  precompute: bool = True,
@@ -47,6 +48,9 @@ class FCLDataManagerC10(object):
         self.T = int(num_tasks)
         self.CPT = int(classes_per_task)
         self.alpha = float(alpha)
+        self.min_samples_per_class_per_client = int(min_samples_per_class_per_client)
+        if self.min_samples_per_class_per_client < 0:
+            raise ValueError("min_samples_per_class_per_client 必须 >= 0")
         self.val_ratio = float(val_ratio)
         self.seed = int(seed)
         self.iid = bool(iid)
@@ -119,12 +123,17 @@ class FCLDataManagerC10(object):
                 counts = np.full(self.K, base, dtype=int)
                 counts[:rem] += 1
             else:
-                p = rng.dirichlet(alpha=np.full(self.K, self.alpha))
-                counts = (p * n).astype(int)
-                while counts.sum() < n:
-                    counts[np.argmax(p)] += 1
-                while counts.sum() > n:
-                    counts[np.argmin(p)] -= 1
+                min_req = min(self.min_samples_per_class_per_client, n // self.K)
+                counts = np.full(self.K, min_req, dtype=int)
+                residual = n - int(counts.sum())
+                if residual > 0:
+                    p = rng.dirichlet(alpha=np.full(self.K, self.alpha))
+                    delta = (p * residual).astype(int)
+                    while delta.sum() < residual:
+                        delta[np.argmax(p)] += 1
+                    while delta.sum() > residual:
+                        delta[np.argmin(p)] -= 1
+                    counts += delta
             st = 0
             for k in range(self.K):
                 take = counts[k]
@@ -172,7 +181,9 @@ class FCLDataManagerC10(object):
 
     def save_partitions(self, out_file: str):
         out = {"config": {"num_clients": self.K, "num_tasks": self.T, "classes_per_task": self.CPT,
-                          "alpha": self.alpha, "val_ratio": self.val_ratio, "seed": self.seed},
+                          "alpha": self.alpha,
+                          "min_samples_per_class_per_client": self.min_samples_per_class_per_client,
+                          "val_ratio": self.val_ratio, "seed": self.seed},
                "tasks": {}}
         for t in range(1, self.T + 1):
             task_entry = {}
@@ -212,7 +223,8 @@ class DataLoaderX(DataLoader):
 class CifarDataProvider10(DataProvider):
     def __init__(self, client_id=10, dataset_location=None, train_batch_size=1024,
                  test_batch_size=256, n_worker=2,
-                 num_clients=10, num_tasks=10, classes_per_task=1, alpha=0.3, val_ratio=0.1, seed=0,
+                 num_clients=10, num_tasks=10, classes_per_task=1, alpha=0.3,
+                 min_samples_per_class_per_client=0, val_ratio=0.1, seed=0,
                  search=True, task_id=1, is_client=True, iid=False):
         self.client_id = client_id
         self.task_id = task_id
@@ -243,6 +255,7 @@ class CifarDataProvider10(DataProvider):
             num_tasks=num_tasks,
             classes_per_task=classes_per_task,
             alpha=alpha,
+            min_samples_per_class_per_client=min_samples_per_class_per_client,
             val_ratio=val_ratio,
             seed=seed,
             precompute=precompute,
@@ -330,10 +343,11 @@ class CifarDataProvider10(DataProvider):
         return 32
 
     def train(self):
+        can_shuffle = len(self.trn_set) > 0
         return DataLoaderX(
             self.trn_set,
             batch_size=self.train_batch_size,
-            shuffle=True,
+            shuffle=can_shuffle,
             num_workers=self.n_worker,
             pin_memory=True,
             drop_last=False,
@@ -342,17 +356,21 @@ class CifarDataProvider10(DataProvider):
     def valid(self):
         if self.search:
             print("搜索阶段使用验证集进行精度评估")
+            valid_set = self.val_set
+            can_shuffle = len(valid_set) > 0
             return DataLoaderX(self.val_set,
                                batch_size=self.test_batch_size,
-                               shuffle=True,
+                               shuffle=can_shuffle,
                                num_workers=self.n_worker,
                                pin_memory=True,
                                drop_last=False)
         else:
             print("重训阶段使用测试集进行精度评估")
+            valid_set = self.test_dataset
+            can_shuffle = len(valid_set) > 0
             return DataLoaderX(self.test_dataset,
                                batch_size=self.test_batch_size,
-                               shuffle=True,
+                               shuffle=can_shuffle,
                                num_workers=self.n_worker,
                                pin_memory=True,
                                drop_last=False)

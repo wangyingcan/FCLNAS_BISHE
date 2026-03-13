@@ -653,6 +653,8 @@ def parse_args() -> argparse.Namespace:
                         help="Default set 1 to IID. Set to 0 for non-IID.")
     parser.add_argument("--dirichlet_alpha", type=float, default=0.3,
                         help="Dirichlet alpha for non-IID client split. Ignored when --iid 1.")
+    parser.add_argument("--dirichlet_min_samples_per_class_per_client", type=int, default=0,
+                        help="非IID划分时，每个任务内每个类别给每个客户端保底样本数（0表示不启用）")
     parser.add_argument("--val_ratio", type=float, default=0.1,
                         help="Validation split ratio inside each client/task partition.")
     parser.add_argument("--unequal", type=int, default=1,

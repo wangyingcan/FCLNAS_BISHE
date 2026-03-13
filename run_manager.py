@@ -2282,6 +2282,7 @@ class CifarRunConfig(RunConfig):
         explicit_cpt = kwargs.get("classes_per_task", None)
         iid = kwargs.get("iid", 0)
         dirichlet_alpha = kwargs.get("dirichlet_alpha", 0.3)
+        dirichlet_min_samples = kwargs.get("dirichlet_min_samples_per_class_per_client", 0)
         val_ratio = kwargs.get("val_ratio", 0.1)
 
         super(CifarRunConfig, self).__init__(
@@ -2314,6 +2315,9 @@ class CifarRunConfig(RunConfig):
         self.num_tasks = int(num_tasks)
         self.iid = bool(int(iid)) if isinstance(iid, (int, bool, str)) else bool(iid)
         self.dirichlet_alpha = float(dirichlet_alpha)
+        self.dirichlet_min_samples_per_class_per_client = int(dirichlet_min_samples)
+        if self.dirichlet_min_samples_per_class_per_client < 0:
+            raise ValueError("dirichlet_min_samples_per_class_per_client 必须 >= 0")
         self.val_ratio = float(val_ratio)
         
         # KD 相关
@@ -2363,6 +2367,7 @@ class CifarRunConfig(RunConfig):
             "classes_per_task": self.classes_per_task,
             "iid": self.iid,
             "alpha": self.dirichlet_alpha,
+            "min_samples_per_class_per_client": self.dirichlet_min_samples_per_class_per_client,
             "val_ratio": self.val_ratio,
             "search": self.search,
         }

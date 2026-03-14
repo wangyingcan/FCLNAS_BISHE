@@ -28,6 +28,7 @@ from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import font_manager
 from matplotlib.lines import Line2D
 
 NUM_TASKS = 10
@@ -54,34 +55,55 @@ COLOR_MAP = {
     "FedCLRas": "#2F2F2F",
 }
 
+LINESTYLE_MAP = {
+    "FedAvg": "-",
+    "TARGET": "-",
+    "ReFed": "-",
+    "AF-FCL": "-",
+    "FedTA": "-",
+    "Ditto": "-",
+    "FedWeIT": "-",
+    "FedCLRas": "-",
+}
+
+MARKER_MAP = {
+    "FedAvg": "o",
+    "TARGET": "s",
+    "ReFed": "D",
+    "AF-FCL": "P",
+    "FedTA": "X",
+    "Ditto": "h",
+    "FedWeIT": "^",
+    "FedCLRas": "*",
+}
+
 # =========================
 # Manual data entry section
 # =========================
 # Replace the demo values below with your real 10-task results.
 INLINE_DATA: Dict[str, Dict[str, List[float]]] = {
-    "FedAvg": {"mean": [63.5, 61.8, 60.9, 59.7, 58.6, 57.8, 56.9, 56.1, 55.4, 54.8]},
-    "TARGET": {"mean": [64.2, 62.4, 61.5, 60.1, 58.9, 58.1, 57.2, 56.3, 55.8, 55.2]},
-    "ReFed": {"mean": [65.0, 63.5, 62.6, 61.2, 60.3, 59.4, 58.6, 57.8, 57.1, 56.4]},
-    "AF-FCL": {"mean": [66.1, 64.8, 63.9, 62.8, 61.9, 61.1, 60.4, 59.7, 59.0, 58.4]},
-    "FedTA": {"mean": [64.8, 63.2, 62.3, 61.1, 60.2, 59.3, 58.5, 57.9, 57.2, 56.8]},
+    "FedAvg": {"mean": [12.5,13.9,26.5,21,36,32.9,34.9,49.9,35,39.7]},
+    "TARGET": {"mean": [16.5,9.6,27.1,27.4,42.5,36.1,39.6,53.3,38.8,45.9]},
+    "ReFed": {"mean": [15,15.2,24.1,22.7,37.7,35,36.1,51.6,38.8,44.1]},
+    "AF-FCL": {"mean": [14.2,15.1,26.9,24.3,40.8,38.2,40.7,54.8,41.2,52.6]},
+    "FedTA": {"mean": [13.2,15.3,25.7,22.6,38.4,34.9,36.5,51.3,37.6,40.7]},
     "Ditto": {
-        "mean": [61.9, 60.1, 58.8, 57.3, 56.2, 55.1, 54.0, 53.0, 52.0, 51.2],
-        "best": [64.1, 62.3, 61.0, 59.4, 58.2, 57.0, 56.1, 55.0, 53.8, 53.0],
-        "worst": [59.6, 57.8, 56.3, 55.0, 53.9, 52.7, 51.5, 50.6, 49.6, 48.9],
+        "mean": [13.13,14.36,15.86,15.76,20.08,20.25,22.68,29.85,23.6,29.23],
+        "best": [40.7,39.2,44.5,51.6,43.3,38.7,35.9,49.9,31,42.5],
+        "worst": [10.0,10.2,11.2,10.8,15.7,15.2,17.8,19.7,12.7,16.8],
     },
     "FedWeIT": {
-        "mean": [66.0, 64.6, 63.8, 62.7, 61.8, 60.9, 60.1, 59.3, 58.6, 58.0],
-        "best": [68.0, 66.7, 65.8, 64.8, 63.9, 63.0, 62.2, 61.3, 60.7, 60.0],
-        "worst": [63.8, 62.3, 61.4, 60.2, 59.4, 58.5, 57.7, 56.9, 56.2, 55.5],
+        "mean": [13.1,17.8,23.3,20.6,36.8,35.6,38.2,50.3,40.5,41.4],
+        # "best": [14.04,19.44,24.79,22.09,38.18,36.5,38.47,50.35,40.77,41.58],
+        # "worst": [12.04,16.14,22.09,19.29,35.88,34.8,38.07,50.15,40.17,41.08],
     },
+    
     "FedCLRas": {
-        "mean": [67.8, 66.5, 65.6, 64.9, 64.3, 63.8, 63.2, 62.6, 62.1, 61.7],
-        "best": [70.2, 69.0, 68.1, 67.2, 66.8, 66.2, 65.8, 65.1, 64.7, 64.1],
-        "worst": [65.3, 64.1, 63.2, 62.5, 61.9, 61.3, 60.7, 60.1, 59.6, 59.2],
+        "mean": [33.1,37.05,39.89,30.2,43.68,40.84,33.76,39.36,29.15,42.31],
+        "best": [39.7,39.8,41.1,32.7,46.8,43.7,35.6,41.8,30.6,45.2],
+        "worst": [27.6,32.3,38.7,27.1,40.8,38.9,32.5,37.4,27.8,40.2],
     },
 }
-
-
 def _load_data(data_json: str | None) -> Dict[str, Dict[str, List[float]]]:
     if not data_json:
         return INLINE_DATA
@@ -108,21 +130,34 @@ def _validate(data: Dict[str, Dict[str, List[float]]]) -> None:
             raise ValueError(f"{method} missing required key: mean")
         _check_vec(method, item["mean"], "mean")
         if method in PERSONALIZED_METHODS:
-            if "best" not in item or "worst" not in item:
-                raise ValueError(
-                    f"{method} must contain best/worst for personalized visualization"
-                )
-            best = _check_vec(method, item["best"], "best")
-            worst = _check_vec(method, item["worst"], "worst")
-            if np.any(best < worst):
-                raise ValueError(f"{method}: best should be >= worst at each task")
+            has_best = "best" in item
+            has_worst = "worst" in item
+            if has_best != has_worst:
+                raise ValueError(f"{method} must provide both best and worst, or neither")
+            if has_best and has_worst:
+                _check_vec(method, item["best"], "best")
+                _check_vec(method, item["worst"], "worst")
 
 
 def _set_style() -> None:
+    cjk_candidates = [
+        "PingFang SC",
+        "Hiragino Sans GB",
+        "Heiti SC",
+        "STHeiti",
+        "Songti SC",
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+    ]
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    picked = next((name for name in cjk_candidates if name in available), "DejaVu Sans")
     plt.rcParams.update(
         {
-            "font.family": "serif",
-            "font.serif": ["Times New Roman", "DejaVu Serif", "STSong"],
+            "font.family": "sans-serif",
+            "font.sans-serif": [picked, "Times New Roman", "DejaVu Sans"],
             "axes.unicode_minus": False,
             "axes.titlesize": 14,
             "axes.labelsize": 13,
@@ -143,7 +178,8 @@ def plot_task_accuracy(
     _validate(data)
 
     x = np.arange(1, NUM_TASKS + 1)
-    fig, ax = plt.subplots(figsize=(12.6, 7.2))
+    fig, ax = plt.subplots(figsize=(14.2, 7.2))
+    fig.subplots_adjust(right=0.78, top=0.88)
 
     line_handles = []
     all_vals = []
@@ -157,14 +193,15 @@ def plot_task_accuracy(
             mean,
             color=color,
             linewidth=2.3,
-            marker="o",
+            linestyle=LINESTYLE_MAP[method],
+            marker=MARKER_MAP[method],
             markersize=4.6,
             label=method,
             alpha=0.98,
         )
         line_handles.append(line)
 
-        if method in PERSONALIZED_METHODS:
+        if method in PERSONALIZED_METHODS and "best" in data[method] and "worst" in data[method]:
             best = np.array(data[method]["best"], dtype=float)
             worst = np.array(data[method]["worst"], dtype=float)
             all_vals.extend(best.tolist())
@@ -197,11 +234,11 @@ def plot_task_accuracy(
     pad = max(2.0, (y_max - y_min) * 0.12)
     ax.set_ylim(np.floor((y_min - pad) / 2) * 2, np.ceil((y_max + pad) / 2) * 2)
 
-    ax.set_xlabel("Task ID")
-    ax.set_ylabel("Accuracy (%)")
+    ax.set_xlabel("")
+    ax.set_ylabel("精度 (%)")
     ax.set_xticks(x)
-    ax.set_xticklabels([f"T{i}" for i in x])
-    ax.set_title(title, pad=12)
+    ax.set_xticklabels([f"任务{i}" for i in x])
+    # 用户要求：不显示图标题
 
     ax.grid(axis="y", linestyle="--", linewidth=0.85, alpha=0.35)
     ax.grid(axis="x", linestyle="-", linewidth=0.4, alpha=0.08)
@@ -210,13 +247,14 @@ def plot_task_accuracy(
 
     legend_methods = ax.legend(
         handles=line_handles,
-        title="Method (Task Mean Accuracy)",
-        ncol=4,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 1.23),
+        title="方法（任务平均精度）",
+        ncol=1,
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.00),
         frameon=False,
-        columnspacing=1.2,
-        handletextpad=0.5,
+        columnspacing=0.9,
+        handletextpad=0.6,
+        borderaxespad=0.0,
     )
     ax.add_artist(legend_methods)
 
@@ -228,7 +266,7 @@ def plot_task_accuracy(
             color="gray",
             linestyle="None",
             markersize=7,
-            label="Best client (personalized methods only)",
+            label="最优客户端（仅个性化方法）",
         ),
         Line2D(
             [0],
@@ -237,14 +275,15 @@ def plot_task_accuracy(
             color="gray",
             linestyle="None",
             markersize=7,
-            label="Worst client (personalized methods only)",
+            label="最差客户端（仅个性化方法）",
         ),
     ]
     ax.legend(
         handles=marker_handles,
-        loc="upper right",
+        loc="upper left",
         frameon=False,
-        bbox_to_anchor=(1.0, 1.02),
+        bbox_to_anchor=(1.01, 0.45),
+        borderaxespad=0.0,
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +320,7 @@ def main() -> None:
     parser.add_argument(
         "--title",
         type=str,
-        default="CIFAR-100 non-IID (alpha=0.3): Task-wise Accuracy Over 10 Tasks",
+        default="CIFAR-100 非IID（α=0.3）10任务精度曲线",
         help="Figure title.",
     )
     args = parser.parse_args()
